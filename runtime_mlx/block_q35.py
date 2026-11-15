@@ -502,7 +502,9 @@ class Block:
     def __init__(self, model, tap_layers=()):
         tm = model.language_model.model
         self.tm, self.table = tm, tm.embed_tokens
-        assert isinstance(self.table, F.FastTable), "the tied embedding must be a coded table"
+        assert isinstance(self.table, F.FastTable), "the embedding must be a coded table"
+        head = getattr(model.language_model, "lm_head", None)     # a head stored apart from the embedding (Qwen3.8-27B)
+        self.head_table = head if isinstance(head, F.FastTable) else self.table
         self.eps = float(tm.norm.eps)
         self.taps = tuple(tap_layers)
         self.cnt = {}
@@ -533,7 +535,7 @@ class Block:
                 for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
                     stage(getattr(a, name)._stage[0])
             self.recs.append(rec)
-        self.head = BlockProduct(self.table.product, threadgroups=HEAD_THREADGROUPS)
+        self.head = BlockProduct(self.head_table.product, threadgroups=HEAD_THREADGROUPS)
         self.stages = list(stages.values())
         self._gdn_pre_kernel = _gdn_pre_t
         self._gdn_step_kernel = _gdn_step_t
@@ -598,7 +600,7 @@ class Block:
         return rec["m_down"](y, T, stride=s_in.size, off0=s_in.slices["gate_proj"][0], off1=s_in.slices["up_proj"][0])
 
     def _head_input(self, h, T):
-        tb = self.table
+        tb = self.head_table
         xr = tb.rot.fwd(mx.broadcast_to(h[:, None, :], (T, tb.nb, tb.n)))        # every bucket's rotation of every state
         return xr.transpose(1, 2, 0)
 

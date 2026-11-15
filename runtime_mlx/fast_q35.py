@@ -480,12 +480,14 @@ _LOOKUPS = {}
 
 
 class FastTable(nn.Module):
-    """The tied embedding, in buckets of rows by token frequency, each with its own code and rotation.
-    __call__ looks rows up; as_linear is the output head."""
+    """A token table, in buckets of rows by token frequency, each with its own code and rotation. rows looks rows up
+    and as_linear is the output head. A tied table (Qwen3.5-4B) is the model's embedding and is called to look rows up;
+    a model that stores its head apart (Qwen3.8-27B) has two, and the one at lm_head (head=True) is called as a layer."""
 
-    def __init__(self, arrays, meta, kind=None):
+    def __init__(self, arrays, meta, kind=None, head=False):
         super().__init__()
         kind = kind or TABLE
+        self.head = bool(head)
         self.V, self.n = meta["shape"]
         groups, signs, bucket_of, local_of, order = [], [], np.zeros(self.V, np.uint16), np.zeros(self.V, np.int32), []
         for i, b in enumerate(meta["buckets"]):
@@ -517,7 +519,10 @@ class FastTable(nn.Module):
         self.lookup = _LOOKUPS[key]
         self.freeze()
 
-    def __call__(self, ids):
+    def __call__(self, x):
+        return self.as_linear(x) if self.head else self.rows(x)
+
+    def rows(self, ids):
         shape = ids.shape
         flat = ids.reshape(-1).astype(mx.int32)
         T = flat.shape[0]
@@ -791,7 +796,8 @@ def load(path, kind=None, verify=True, fuse=None):
     stages = {}
     for name, meta in manifest["matrices"].items():
         if meta["kind"] == "table":
-            _set(model, rename(name).removesuffix(".weight"), FastTable(arrays, meta, kind))
+            at = rename(name).removesuffix(".weight")
+            _set(model, at, FastTable(arrays, meta, kind, head=at.endswith("lm_head")))
             continue
         owner, attr = rename(name).removesuffix(".weight").rsplit(".", 1)
         signs = np.asarray(arrays[meta["signs"]])

@@ -3,6 +3,7 @@ Qwen3.5 file is on this Mac, against fast_q35's one-token decoding from the same
 
     python runtime_mlx/test_block_q35.py
     LAMQ_Q35_PACKED=path/to/packed python runtime_mlx/test_block_q35.py      # the packed file somewhere else
+    LAMQ_Q38_PACKED=path/to/packed ...                                       # and the packed Qwen3.8-27B (a head of its own)
 """
 import os
 import sys
@@ -21,6 +22,7 @@ from runtime_mlx import fast_q35 as F
 from runtime_mlx.test_fast_q35 import scalar_group, trellis_group
 
 PACKED = Path(os.environ.get("LAMQ_Q35_PACKED") or ROOT.parent / "bench_models" / "lamq" / "q35_SQYFR_1p2GB")
+PACKED38 = Path(os.environ.get("LAMQ_Q38_PACKED") or ROOT.parent / "bench_models" / "lamq" / "q38_27b_tuned4")
 
 
 TOL = {"float": 2e-5, "half": 1e-3}   # tables as the file holds them, and as 16-bit floats (what the runtime keeps)
@@ -78,11 +80,13 @@ class BlockProductTest(unittest.TestCase):
 
 @unittest.skipUnless(PACKED.exists(), f"{PACKED} is not on this machine")
 class BlockModelTest(unittest.TestCase):
+    packed, taps = PACKED, (1, 29)
+
     @classmethod
     def setUpClass(cls):
         from mlx_lm.models.cache import ArraysCache, KVCache
-        cls.model, cls.tok = F.load(PACKED, verify=False)
-        cls.block = B.Block(cls.model, tap_layers=(1, 29))
+        cls.model, cls.tok = F.load(cls.packed, verify=False)
+        cls.block = B.Block(cls.model, tap_layers=cls.taps)
 
         def snapshot(cache):
             out = []
@@ -118,7 +122,7 @@ class BlockModelTest(unittest.TestCase):
             self.block.pending = None
             self.assertEqual(got.argmax(1).tolist(), want.argmax(1).tolist())
             self.assertLess(np.abs(got - want).max(), 0.05)
-            self.assertEqual(taps[1].shape, (T, got.shape[0] and self.block.table.n))
+            self.assertEqual(taps[self.taps[0]].shape, (T, got.shape[0] and self.block.table.n))
 
     def test_greedy_check_matches_serial(self):
         for T in (8, 16):
@@ -149,6 +153,19 @@ class BlockModelTest(unittest.TestCase):
         self.block.flush(cache)                               # and one token at a time from there
         for j in range(at, at + 4):
             self.assertEqual(int(self.step(self.tokens[j], cache).argmax()), int(self.logits[j].argmax()), j)
+
+
+@unittest.skipUnless((PACKED38 / "artifact.json").exists(), "the packed Qwen3.8-27B file is not on this Mac")
+class SeparateHeadTest(BlockModelTest):
+    """The same checks on a model whose output head is stored apart from its embedding (Qwen3.8-27B). Until 2026-11-14
+    the head's table was called as a lookup, so a prompt's logits came out (tokens, hidden, hidden)."""
+    packed, taps = PACKED38, (1, 61)
+
+    def test_the_head_is_its_own_table(self):
+        self.assertIsNot(self.block.head_table, self.block.table)
+        self.assertTrue(self.block.head_table.head and not self.block.table.head)
+        logits = self.model(mx.array([[1, 2, 3]]), cache=self.model.make_cache())
+        self.assertEqual(logits.shape, (1, 3, self.block.head_table.V))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ class DraftVocabulary:
     """Use the target's row codes, scales and rotations for a subset of token IDs."""
 
     def __init__(self, block, keep):
-        self.table = block.table
+        self.table = getattr(block, "head_table", block.table)    # the output head's rows (the embedding's, when tied)
         original = self.table.product
         codes, scales, rowmap, tables, dims, groups = original.args
         rowmap = np.asarray(rowmap)

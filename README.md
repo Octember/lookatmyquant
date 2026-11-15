@@ -14,6 +14,10 @@ The recipe is post-training quantization with trellis codes, calibrated on the m
 
 The recipe's code is here, and the next section runs it. The 1.23 GB file itself is the [`lm2-qwen35-4b-1.2gb` release](https://github.com/ShinMegamiBoson/lookatmyquant/releases/tag/lm2-qwen35-4b-1.2gb), packed for the Apple Silicon runtime.
 
+## Qwen3.8-27B in 7.2 GB
+
+The same recipe takes Qwen3.8-27B from 53.7 GB to 7.2 GB, 2.1 bits per weight, calibrated and distilled on English prose and chat, code and math. [The file](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB) solves 401 of the 540 math problems, as many as the original, and Unsloth's `UD-IQ2_XXS` GGUF of the same size solves 348. It also scores above that GGUF on HumanEval (73.8% against 67.1%), MMLU (78.8% against 75.0%) and GSM8K (94.5% against 92.7%). Its page has every result and the command that runs it with `runtime_mlx/fast_q35.py`.
+
 ## Run the compiler on SmolLM2-360M in three commands
 
 Install the dependencies and download the model and WikiText-2. The code reads SmolLM2-360M's config when it starts, so do this first.
@@ -190,7 +194,7 @@ python tests/test_rowgroup_alloc.py
 
 `runtime_mlx/test_core.py` checks the runtime against the quantizer's math. Run `python runtime_mlx/make_ref.py` first, which writes 1.6 GB of reference files.
 
-`runtime_mlx/test_fast_q35.py` and `runtime_mlx/test_block_q35.py` check the Qwen3.5 kernels against NumPy products of independently unpacked codes, with no model. When `LAMQ_Q35_PACKED` names a packed file, the second also checks a block of tokens against decoding them one at a time.
+`runtime_mlx/test_fast_q35.py` and `runtime_mlx/test_block_q35.py` check the Qwen3.5 kernels against NumPy products of independently unpacked codes, with no model. When `LAMQ_Q35_PACKED` names a packed file, the second also checks a block of tokens against decoding them one at a time. When `LAMQ_Q38_PACKED` names the packed Qwen3.8-27B file, it runs the same checks on a model whose output head is stored apart from its embedding.
 
 ## What this repository leaves out
 
