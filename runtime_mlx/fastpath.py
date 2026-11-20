@@ -25,8 +25,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-import lamq
-import model as lm
+try:
+    from . import lamq
+    from . import model as lm
+except ImportError:  # run as a script beside lamq.py and model.py
+    import lamq
+    import model as lm
 
 _HEADER = """
 // XP: the stride of a run of 32 inputs in threadgroup memory (33 pads each run, so lanes on different runs hit different banks)

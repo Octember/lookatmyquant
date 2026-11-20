@@ -208,7 +208,7 @@ def propose(drafter, states, anchor):
     """Choose a fused top-two proposal and its fork position."""
     assert states.shape[0] == 7
     compact = drafter.proposal_head
-    table = drafter.block.table
+    table = getattr(drafter.block, "head_table", drafter.block.table)
     pad = mx.concatenate(
         [states.astype(mx.float32), mx.zeros((1, table.n), mx.float32)]
     )

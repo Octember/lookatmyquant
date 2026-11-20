@@ -86,9 +86,10 @@ class DraftVocabulary:
 
 def qwen_prefix(block, tokenizer):
     """Keep the frequent BPE prefix and all tokenizer-defined added tokens."""
-    if block.table.V <= PREFIX_ROWS:
+    table = getattr(block, "head_table", block.table)
+    if table.V <= PREFIX_ROWS:
         return None
-    keep = np.arange(block.table.V) < PREFIX_ROWS
+    keep = np.arange(table.V) < PREFIX_ROWS
     for i in tokenizer.get_added_vocab().values():
         if 0 <= i < len(keep):
             keep[i] = True

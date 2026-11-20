@@ -20,6 +20,7 @@ the row's end (compiler_artifact.pack_trellis). A prompt of more than one token 
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import sys
@@ -29,7 +30,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+if importlib.util.find_spec("compiler_artifact") is None:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 L_STATE = 12
 RPS = 4            # rows a lane carries per pass over its columns

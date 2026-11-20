@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lookatmyquant"
+version = "0.2.0"
+description = "Quantization compiler and Apple Silicon MLX runtime for LookAtMyQuant models"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "huggingface-hub",
+    "mlx; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+compiler = [
+    "torch==2.14.0",
+    "transformers==5.16.1",
+    "datasets==4.6.1",
+    "safetensors==0.8.0",
+    "pandas",
+    "modal",
+]
+
+[project.scripts]
+lamq = "runtime_mlx.cli:main"
+
+[tool.setuptools]
+py-modules = ["compiler_artifact"]
+packages = ["runtime_mlx", "runtime_mlx.strategies", "opgraph"]

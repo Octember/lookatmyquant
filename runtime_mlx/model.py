@@ -13,7 +13,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-import lamq
+try:
+    from . import lamq
+except ImportError:  # run as a script beside lamq.py
+    import lamq
 
 _ROWS_SRC = """
     const uint ncodes = dims[0], wpr = dims[1];

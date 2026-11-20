@@ -149,9 +149,16 @@ def _weights(path):
     its table's value at the row's state times the row's scale, with the input rotation undone."""
     if not (path / "artifact.json").exists():
         return mx.load(str(path / "model.safetensors"))
+    import importlib.util
+    import sys
     import numpy as np
+    if importlib.util.find_spec("compiler_artifact") is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from compiler_artifact import decode_rotated, read_artifact
-    import lamq                      # fast_q35, loaded before any drafter, has put it in sys.modules
+    try:
+        from . import lamq
+    except ImportError:  # run as a script beside lamq.py
+        import lamq
     arrays, manifest = read_artifact(path, verify=False)
     w = {}
     for name in manifest["dense"]:
@@ -160,7 +167,11 @@ def _weights(path):
     for name, meta in manifest["matrices"].items():
         rot = lamq.Rot(np.asarray(arrays[meta["signs"]], dtype=np.float32))
         coded = decode_rotated(arrays, meta)                                   # W Rᵀ, in float32
-        rows = [rot.bwd(mx.array(coded[i : i + 8192])).astype(mx.float16) for i in range(0, len(coded), 8192)]   # each row times R
+        step = max(1, min(8192, (1 << 30) // (rot.n * rot.p)))                  # Rot's product holds rows × n × p floats at once: 4 GB of them at most
+        rows = []                                                              # (8,192 rows of a 25,600-wide matrix, p = 200, asked for 105 GB)
+        for i in range(0, len(coded), step):
+            rows.append(rot.bwd(mx.array(coded[i : i + step])).astype(mx.float16))   # each row times R
+            mx.eval(rows[-1])
         w[name] = mx.concatenate(rows) if len(rows) > 1 else rows[0]
         mx.eval(w[name])
     return w
@@ -238,7 +249,12 @@ class Drafter:
         self.S += ctx.shape[0]
 
     def feature(self, h, L):
-        f = L["readout"](h).astype(mx.float32)
+        """A state's code: its direction through the layer's readout. The state is divided by its RMS before the read,
+        as Tencent's bridge does; the code is the same and the read stays in float16's range (a raw read of the
+        5,120-wide drafter's states, which reach 17,000, passed 65,504 and every proposal became token 0)."""
+        hf = h.astype(mx.float32)
+        unit = (hf * mx.rsqrt(mx.maximum(mx.mean(hf * hf, axis=-1, keepdims=True), 1e-24))).astype(self.dtype)
+        f = L["readout"](unit).astype(mx.float32)
         return (math.sqrt(self.rank) * f / mx.maximum(mx.linalg.norm(f, axis=-1, keepdims=True), 1e-12)).astype(self.dtype)
 
     def write(self, h, receiver, predecessor, L):
@@ -313,7 +329,9 @@ class Drafter:
         gate = mx.sigmoid(self.receiver_gate(self.feature(pre, L))[:, None, :] + self.predecessor_gate(code) + self.bias)
         scale = (mx.linalg.norm(pre.astype(mx.float32), axis=-1, keepdims=True) / math.sqrt(self.H)).astype(self.dtype)
         refined = _rms(pre[:, None, :] + scale[:, None, :] * L["write"](gate * self.message(code)), self.norm, self.eps)   # (P, K, H): the state after each token before
-        scores = refined.astype(mx.float32) @ self.table(cand).astype(mx.float32).transpose(0, 2, 1)   # [position, token before, candidate]
+        head = getattr(self.block, "head_table", None)            # the head's rows; a tied table's are the embedding's
+        rows = head.rows(cand) if head is not None else self.table(cand)
+        scores = refined.astype(mx.float32) @ rows.astype(mx.float32).transpose(0, 2, 1)   # [position, token before, candidate]
         chosen, k = [], mx.array(0)
         for i in range(P):
             k = mx.argmax(mx.take(scores[i], k, axis=0))
@@ -355,11 +373,61 @@ def _prefill(model, block, prompt, cache, taps):
             backbone(tokens[None, lo : min(lo + 2048, len(tokens) - 1)], cache=cache)
             mx.eval([c.state for c in cache])
         h = backbone(tokens[None, -1:], cache=cache)
-        first = mx.argmax(block.table.as_linear(h)[0, -1])
+        first = mx.argmax(getattr(block, "head_table", block.table).as_linear(h)[0, -1])
         mx.eval(first, [c.state for c in cache])
     finally:
         set_taps(model, ())
     return first, got
+
+
+def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear", stats_out=None):
+    """Yield lists of accepted greedy token IDs as each round finishes. If `stats_out` is a dict, it is
+    populated with the run's timing and acceptance statistics when iteration finishes."""
+    if mode not in ("linear", "chat-fork", "copy-wide"):
+        raise ValueError(f"unknown drafter mode: {mode}")
+    if mode != "linear" and (size != 8 or drafter.path):
+        raise ValueError(f"{mode} requires size=8 and greedy proposals")
+    if max_tokens <= 0:
+        if stats_out is not None:
+            stats_out.update({"rounds": 0, "kept": [], "round_ms": [], "prompt_s": 0.0, "drafter_prompt_s": 0.0,
+                              "rounds_s": 0.0, "tokens": 0, "tokens_per_check": 0.0})
+        return
+    old = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    proposal_head = drafter.proposal_head
+    try:
+        if proposal_head is not None and not proposal_head.covers_prompt(prompt):
+            drafter.proposal_head = None
+        if mode == "linear" and _generate is _generate_linear:
+            yield from _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, stats_out=stats_out)
+            return
+        if mode == "linear":
+            tokens, stats = _generate(model, block, drafter, prompt, max_tokens, size, eos)
+        elif mode == "chat-fork":
+            if __package__:
+                from .strategies.tree_verifier_q35 import generate as generate_tree
+            else:
+                from strategies.tree_verifier_q35 import generate as generate_tree
+            tokens, stats = generate_tree(model, block, drafter, prompt, max_tokens, size, eos)
+        else:
+            if __package__:
+                from .strategies.copy_wide_q35 import CopyWideGeometry
+                from .strategies.ngram_source_cursor import generate as generate_copy
+            else:
+                from strategies.copy_wide_q35 import CopyWideGeometry
+                from strategies.ngram_source_cursor import generate as generate_copy
+            if not hasattr(block, "_copy_wide_geometry"):
+                block._copy_wide_geometry = CopyWideGeometry(block)
+            with block._copy_wide_geometry.installed():
+                tokens, stats = generate_copy(model, block, drafter, prompt, max_tokens, size, eos, wide=True)
+        if stats_out is not None:
+            stats_out.update(stats)
+        if tokens:
+            yield tokens
+    finally:
+        block.discard()  # generation owns its caches; no caller will resume them
+        drafter.proposal_head = proposal_head
+        mx.synchronize()
+        mx.set_wired_limit(old)
 
 
 def generate(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear"):
@@ -369,43 +437,14 @@ def generate(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode=
     16-slot checks with tuned feed-forward kernels on known contiguous copies.
     Memory is wired for the run as mlx_lm's own generation wires it (a run that follows one of mlx_lm's without this
     measured 25 to 30 ms a round against 22.7)."""
-    if mode not in ("linear", "chat-fork", "copy-wide"):
-        raise ValueError(f"unknown drafter mode: {mode}")
-    if mode != "linear" and (size != 8 or drafter.path):
-        raise ValueError(f"{mode} requires size=8 and greedy proposals")
-    old = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
-    proposal_head = drafter.proposal_head
-    try:
-        if proposal_head is not None and not proposal_head.covers_prompt(prompt):
-            drafter.proposal_head = None
-        if mode == "linear":
-            return _generate(model, block, drafter, prompt, max_tokens, size, eos)
-        if mode == "chat-fork":
-            if __package__:
-                from .strategies.tree_verifier_q35 import generate as generate_tree
-            else:
-                from strategies.tree_verifier_q35 import generate as generate_tree
-            return generate_tree(model, block, drafter, prompt, max_tokens, size, eos)
-
-        if __package__:
-            from .strategies.copy_wide_q35 import CopyWideGeometry
-            from .strategies.ngram_source_cursor import generate as generate_copy
-        else:
-            from strategies.copy_wide_q35 import CopyWideGeometry
-            from strategies.ngram_source_cursor import generate as generate_copy
-        if not hasattr(block, "_copy_wide_geometry"):
-            block._copy_wide_geometry = CopyWideGeometry(block)
-        with block._copy_wide_geometry.installed():
-            return generate_copy(model, block, drafter, prompt, max_tokens, size, eos, wide=True)
-    finally:
-        block.discard()  # generation owns its caches; no caller will resume them
-        drafter.proposal_head = proposal_head
-        mx.synchronize()
-        mx.set_wired_limit(old)
+    out, stats = [], {}
+    for chunk in stream(model, block, drafter, prompt, max_tokens, size, eos, mode=mode, stats_out=stats):
+        out.extend(chunk)
+    return out[:max_tokens], stats
 
 
-def _generate_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
-                     copy_index=None, wide_index=None, deferred_context=None):
+def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
+                 copy_index=None, wide_index=None, deferred_context=None, stats_out=None):
     eos, cache = set(eos), model.make_cache()
     t0 = time.perf_counter()
     first, got = _prefill(model, block, prompt, cache, drafter.taps)
@@ -421,66 +460,83 @@ def _generate_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
             wide_index.seed(prompt, first_id)
     t2 = time.perf_counter()
     out, anchor, rounds, times = [first_id], first, [], [t2]
-    drafter.torn = False
-    while len(out) < max_tokens and out[-1] not in eos:
-        p = copy_index.proposals() if copy_index is not None else None
-        copied = p is not None
-        ordinary_wide = False
-        width = size
-        if copied:
-            if wide_index is not None and max_tokens - len(out) >= 16:
-                longer, ordinary_wide = copy_index.wide_proposals(wide_index, p)
-                if longer is not None:
-                    p, width = longer, 16
-            tokens = mx.array([out[-1], *p], dtype=anchor.dtype)
-        else:
-            if deferred_context is not None:
-                deferred_context.flush(drafter)
-            states, pre = drafter.draft(anchor, size)
-            proposed = drafter.tokens(states, size, pre, anchor)
-            if OVERLAP:
-                mx.async_eval(proposed)                        # the GPU starts on the draft while Python lists the check's launches
-            tokens = mx.concatenate([anchor.reshape(1).astype(proposed.dtype), proposed])
-        own, taps = block.check(tokens, cache, top1=True)
-        if copied:
-            mx.eval(own)
-        else:
-            mx.eval(proposed, own)
-            p = proposed.tolist()
-        t = own.tolist()
-        a = 0
-        while a < width - 1 and p[a] == t[a] and p[a] not in eos:
-            a += 1
-        kept = a + 1                                           # the anchor and the proposals that were right
-        emitted = p[:a] + [t[a]]
-        out += emitted
-        rounds.append(kept)
-        finished = len(out) >= max_tokens or out[-1] in eos
-        if copy_index is not None:
-            first_rejected = p[0] != t[0] if copied else None
-            copy_index.observe(emitted, len(rounds) - 1, first_rejected, finished)
-        if wide_index is not None:
-            wide_index.observe(emitted, len(rounds) - 1, first_rejected if width == 16 else None,
-                               finished, reject_key=ordinary_wide)
-        if finished:
+    try:
+        yield [first_id]
+        drafter.torn = False
+        while len(out) < max_tokens and out[-1] not in eos:
+            p = copy_index.proposals() if copy_index is not None else None
+            copied = p is not None
+            ordinary_wide = False
+            width = size
+            if copied:
+                if wide_index is not None and max_tokens - len(out) >= 16:
+                    longer, ordinary_wide = copy_index.wide_proposals(wide_index, p)
+                    if longer is not None:
+                        p, width = longer, 16
+                tokens = mx.array([out[-1], *p], dtype=anchor.dtype)
+            else:
+                if deferred_context is not None:
+                    deferred_context.flush(drafter)
+                states, pre = drafter.draft(anchor, size)
+                proposed = drafter.tokens(states, size, pre, anchor)
+                if OVERLAP:
+                    mx.async_eval(proposed)                        # the GPU starts on the draft while Python lists the check's launches
+                tokens = mx.concatenate([anchor.reshape(1).astype(proposed.dtype), proposed])
+            own, taps = block.check(tokens, cache, top1=True)
+            if copied:
+                mx.eval(own)
+            else:
+                mx.eval(proposed, own)
+                p = proposed.tolist()
+            t = own.tolist()
+            a = 0
+            while a < width - 1 and p[a] == t[a] and p[a] not in eos:
+                a += 1
+            kept = a + 1                                           # the anchor and the proposals that were right
+            emitted = p[:a] + [t[a]]
+            prev_len = len(out)
+            out += emitted
+            rounds.append(kept)
+            finished = len(out) >= max_tokens or out[-1] in eos
+            if copy_index is not None:
+                first_rejected = p[0] != t[0] if copied else None
+                copy_index.observe(emitted, len(rounds) - 1, first_rejected, finished)
+            if wide_index is not None:
+                wide_index.observe(emitted, len(rounds) - 1, first_rejected if width == 16 else None,
+                                   finished, reject_key=ordinary_wide)
+            if finished:
+                times.append(time.perf_counter())
+                yield emitted[: max_tokens - prev_len]
+                break
+            block.commit(cache, kept)
+            accepted_taps = [taps[i][:kept] for i in drafter.taps]
+            if deferred_context is None:
+                drafter.context(accepted_taps)
+                projected = True
+            else:
+                projected = deferred_context.push(drafter, accepted_taps, defer=copied)
+            if OVERLAP and projected:                              # project context while Python lists the next draft
+                mx.async_eval([x for c in drafter.cache for x in (c.keys, c.values)])   # the buffers themselves: a cache's .state is a copy
+            anchor = own[a]
+            drafter.torn = kept < width
             times.append(time.perf_counter())
-            break
-        block.commit(cache, kept)
-        accepted_taps = [taps[i][:kept] for i in drafter.taps]
-        if deferred_context is None:
-            drafter.context(accepted_taps)
-            projected = True
-        else:
-            projected = deferred_context.push(drafter, accepted_taps, defer=copied)
-        if OVERLAP and projected:                              # project context while Python lists the next draft
-            mx.async_eval([x for c in drafter.cache for x in (c.keys, c.values)])   # the buffers themselves: a cache's .state is a copy
-        anchor = own[a]
-        drafter.torn = kept < width
-        times.append(time.perf_counter())
-    t3 = time.perf_counter()
-    out = out[:max_tokens]
-    return out, {"rounds": len(rounds), "kept": rounds, "round_ms": [round((y - x) * 1e3, 2) for x, y in zip(times, times[1:])], "prompt_s": t1 - t0, "drafter_prompt_s": t2 - t1, "rounds_s": t3 - t2,
-                 "tokens": len(out), "tokens_per_check": (len(out) - 1) / max(1, len(rounds))}
+            yield emitted[: max_tokens - prev_len]
+    finally:
+        t3 = time.perf_counter()
+        out = out[:max_tokens]
+        if stats_out is not None:
+            stats_out.update({"rounds": len(rounds), "kept": rounds, "round_ms": [round((y - x) * 1e3, 2) for x, y in zip(times, times[1:])], "prompt_s": t1 - t0, "drafter_prompt_s": t2 - t1, "rounds_s": t3 - t2,
+                              "tokens": len(out), "tokens_per_check": (len(out) - 1) / max(1, len(rounds))})
+
+
+def _generate_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
+                     copy_index=None, wide_index=None, deferred_context=None):
+    out, stats = [], {}
+    for chunk in _iter_linear(model, block, drafter, prompt, max_tokens, size, eos,
+                              copy_index=copy_index, wide_index=wide_index,
+                              deferred_context=deferred_context, stats_out=stats):
+        out.extend(chunk)
+    return out[:max_tokens], stats
 
 
 _generate = _generate_linear  # Experimental benchmarks can replace this dispatch.

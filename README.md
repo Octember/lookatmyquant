@@ -16,7 +16,63 @@ The recipe's code is here, and the next section runs it. The 1.23 GB file itself
 
 ## Qwen3.8-27B in 7.2 GB
 
-The same recipe takes Qwen3.8-27B from 53.7 GB to 7.2 GB, 2.1 bits per weight, calibrated and distilled on English prose and chat, code and math. [The file](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB) solves 401 of the 540 math problems, as many as the original, and Unsloth's `UD-IQ2_XXS` GGUF of the same size solves 348. It also scores above that GGUF on HumanEval (73.8% against 67.1%), MMLU (78.8% against 75.0%) and GSM8K (94.5% against 92.7%). Its page has every result and the command that runs it with `runtime_mlx/fast_q35.py`.
+The same recipe takes Qwen3.8-27B from 53.7 GB to 7.2 GB, 2.1 bits per weight, calibrated and distilled on English prose and chat, code and math. [The file](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB) solves 401 of the 540 math problems, as many as the original, and Unsloth's `UD-IQ2_XXS` GGUF of the same size solves 348. It also scores above that GGUF on HumanEval (73.8% against 67.1%), MMLU (78.8% against 75.0%) and GSM8K (94.5% against 92.7%).
+
+Beside it sits [a 4-bit DSpine drafter](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter) (1.02 GB, converted from `tencent/Qwen3.8-27B-DSpine-b16` with `runtime_mlx/convert_dspine.py` and packed with `pack_drafter.py`), which roughly doubles decode speed on math and code on Apple silicon.
+
+## Install and use the Apple Silicon runtime
+
+On Apple silicon, install the runtime package directly (this installs `mlx`, `mlx-lm`, `numpy`, and `huggingface-hub` without the PyTorch compiler dependencies):
+
+```sh
+pip install git+https://github.com/ShinMegamiBoson/lookatmyquant.git
+```
+
+From a local clone, `pip install -e .` installs the `lamq` command, or run `python -m runtime_mlx` without installing.
+
+**Command line.** Pass either a local model folder or a Hugging Face repo ID:
+
+```sh
+lamq generate shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
+    -p "What is 17 times 23? Show the steps."
+
+lamq generate shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
+    --drafter shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter \
+    -p "Write a Python function that merges overlapping intervals." --stats
+
+lamq chat shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
+    --drafter shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter
+```
+
+`lamq generate` reads stdin when `-p` is omitted, supports `--raw`, `--system`, `--thinking`, `--temp`, `--mode linear|chat-fork|copy-wide`, and `--json`. `lamq info <model>` inspects a packed model's format and dimensions without loading weights.
+
+**Python integration.** `runtime_mlx.load` returns an `(model, tokenizer)` pair compatible with `mlx_lm.generate` and `mlx_lm.stream_generate` (auto-detecting `opgraph-packed-1` models such as Qwen3.5-4B / Qwen3.8-27B and `lamq.json` exports such as Gemma 4 E2B):
+
+```python
+from mlx_lm import generate
+from runtime_mlx import load
+
+model, tok = load("shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB")
+prompt = tok.apply_chat_template(
+    [{"role": "user", "content": "What is 17 times 23? Show the steps."}],
+    add_generation_prompt=True,
+    enable_thinking=False,
+)
+print(generate(model, tok, prompt, max_tokens=200))
+```
+
+For streaming, multi-turn chat, or speculative decoding through one interface, use `Runtime`:
+
+```python
+from runtime_mlx import Runtime
+
+rt = Runtime.load(
+    "shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB",
+    drafter="shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter",
+)
+for chunk in rt.stream("Solve 3x + 4y = 31 and 5x - 2y = 17.", max_tokens=256):
+    print(chunk.text, end="", flush=True)
+```
 
 ## Run the compiler on SmolLM2-360M in three commands
 
@@ -105,7 +161,7 @@ The runs behind the site used these machines, each with 8 CPU cores:
 
 ## The Apple Silicon runtime reads Lloyd–Max and trellis plans
 
-`quantize.py --export <folder>` writes a plan in the format `runtime_mlx/` reads. A plan with trellis codes also needs `--trellis-rows 16,8`, which runs each trellis path along a row of its matrix, so that decoding an entry reads only that row. The runtime needs `mlx` and `mlx_lm`, which are not in `requirements.txt`.
+`quantize.py --export <folder>` writes a plan in the format `runtime_mlx/` reads. A plan with trellis codes also needs `--trellis-rows 16,8`, which runs each trellis path along a row of its matrix, so that decoding an entry reads only that row. On Apple silicon, `pip install .` installs `mlx` and `mlx-lm`; `requirements.txt` holds the PyTorch compiler dependencies.
 
 On Gemma 4 E2B at 2.5 GB, the trellis plan has 26% lower KL than the Lloyd–Max plan and decodes about 22% slower. `runtime_mlx/test_trellis_gen.py` and `runtime_mlx/test_trellis.py` check the trellis kernels against the matrices the quantizer built.
 
@@ -163,9 +219,10 @@ python pack_drafter.py path/to/drafter path/to/drafter-4bit
 | `finetune.py`, `finetune_lib.py`, `fast_delta.py` | Fine-tuning that ends on the codes, and a faster linear-attention rule for Qwen3.5 |
 | `math_bench.py`, `math_eval.py`, `text_kl.py` | The exact-answer math benchmark, its runner for the Qwen3.5 family and Bonsai, and KL from the original on text |
 | `gguf_compiler.py`, `public_eval.py`, `eval_tasks.py` | The llama.cpp route, public quantizations and task benchmarks |
+| `pyproject.toml`, `runtime_mlx/runtime.py`, `runtime_mlx/cli.py` | Installable Apple Silicon runtime package, unified `load`/`Runtime` Python API, and `lamq` CLI |
 | `lamq_export.py`, `runtime_mlx/` | The export format and the Apple Silicon runtime |
-| `runtime_mlx/fast_q35.py`, `block_q35.py`, `block_argmax_q35.py`, `pack_dense.py`, `modal_pack.py` | The runtime for the packed 1.2 GB file: one token at a time, a block of 8 or 16 tokens in one pass, and the packer |
-| `runtime_mlx/drafter_q35.py`, `draft_vocab_q35.py`, `check_drafter.py`, `bench_drafted.py`, `drafter/`, `modal_drafter.py`, `pack_drafter.py` | Speculative decoding with a DSpine drafter, the drafter's training, and the drafter stored at 4 bits |
+| `runtime_mlx/fast_q35.py`, `block_q35.py`, `block_argmax_q35.py`, `pack_dense.py`, `modal_pack.py` | The runtime for packed Qwen3.5-4B and Qwen3.8-27B files: one token at a time, a block of 8 or 16 tokens in one pass, and the packer |
+| `runtime_mlx/drafter_q35.py`, `draft_vocab_q35.py`, `convert_dspine.py`, `check_drafter.py`, `bench_drafted.py`, `drafter/`, `modal_drafter.py`, `pack_drafter.py` | Speculative decoding with a DSpine drafter, Tencent DSpine conversion, drafter training, and the drafter stored at 4 bits |
 | `opgraph/` | The grammar: a model as a tensor network, and the rewrites and codes that act on it |
 | `run_completeness.py`, `make_report.py` | The check that nine published methods are reproduced exactly |
 | `analyze_compiler.py` | The tables of plan results |
