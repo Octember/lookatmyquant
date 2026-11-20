@@ -349,10 +349,11 @@ def measure(args):
         V = emb.weight.shape[0]
         sizes = rq.embedding_buckets(V)
         freq = mix.frequency(V) if mix else torch.bincount(rq.token_ids(tok, "train", tag).reshape(-1), minlength=V)[:V].double()
-        order = torch.sort(-freq, stable=True).indices
+        sf = rq.softmax_fisher(model, chunks) if args.embed_order != "freq" else None
+        base_src = "the text mix" if mix else "the WikiText-2 training split"
         H_out = rq.head_inputs(model, chunks)
         out["embed buckets"] = sizes
-        out["embed order"] = "frequency in the text mix" if mix else "frequency in the WikiText-2 training split"
+        out["embed order"] = f"frequency in {base_src}" if args.embed_order == "freq" else f"{args.embed_order} in {base_src}"
         out["tied"] = tied
         emb_opts = menu(args.embed_options, EMBED_OPTIONS)
         tables = [("embed", emb.weight, rq.embedding_environment(H_out, "both" if tied else "lookup"), 7000)]
@@ -363,6 +364,9 @@ def measure(args):
             tables.append(("ple", ple.weight, rq.ple_metrics(model, chunks, args.ple_damp) if args.ple_metric else None, 9000))
         ple_block = getattr(cfg, "hidden_size_per_layer_input", None)
         for kind, Wt, Hh, seed0 in tables:
+            t_mode = "freq" if kind == "ple" else ("sfisher" if kind == "head" and args.embed_order != "freq" else (args.embed_order if tied or kind != "embed" or args.embed_order != "sfisher" else "freq"))
+            score = rq.token_importance(freq, sf, t_mode)
+            order = torch.sort(-score, stable=True).indices
             lo = 0
             for k, size in enumerate(sizes):
                 rows = order[lo : lo + size]
@@ -698,6 +702,8 @@ def main():
     m.add_argument("--part", default="linear", help="linear, experts, embed (and head, if untied), kv (comma-separated)")
     m.add_argument("--options", default="", help="matrix options to measure (default all; fp16 always)")
     m.add_argument("--embed-options", default="", help="embedding options to measure (default all; fp16 always)")
+    m.add_argument("--embed-order", choices=["freq", "sfisher-mix", "sfisher"], default="freq",
+                   help="token importance score for bucketing token tables (sfisher-mix: 50/50 Softmax-Fisher + frequency)")
     m.add_argument("--ple-options", default="", help="the per-layer table's options, if different (mean: its rows share one)")
     m.add_argument("--ple-metric", action="store_true", help="round the per-layer table in the output space of what reads it")
     m.add_argument("--ple-center", action="store_true", help="store each bucket's mean row apart, and code the residual")

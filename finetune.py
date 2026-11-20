@@ -19,10 +19,13 @@ The recipe's options:
   --rebuild-at t      from step t each group's next re-quantization starts once from the original model's weights, under
                       the statistics as they then stand, and its W restarts on the new P. Weights that sit on their codes
                       quantize to the same codes under any statistics, so this is what changes the codes
+  --realloc-at t      at step t (paired with --rebuild-at t), re-solve equal-byte row bit widths k in {1..4} across all
+                      layers using each layer's empirical continuous-vs-stored proximal KL gap KL(all P) - KL(layer=W)
+                      for cross-layer budget and output Fisher * H-weighted row energy for intra-layer ranking
 
     python finetune.py --codes build/codes.pt --base-dense build/dense.pt --math-cache cache/math_checked.pt \
         --more-text cache/other_text.pt:science+code --refit-handles --train-norms --train-embedding \
-        --running-stats --rebuild-at 1000 --save tuned/dense.pt --out results/finetune.json     (run_batch.py: lm2Finetune)
+        --running-stats --rebuild-at 1000 --realloc-at 1000 --save tuned/dense.pt --out results/finetune.json     (run_batch.py: lm2Finetune)
 
 The other options are measurements and variants that the recipe does not use: --project-share (re-quantize only the rows
 that drifted most; no faster), a weaker --beta (the weights drift further and the gain on math is lost), --gate-pull
@@ -52,10 +55,96 @@ from finetune_lib import CodedTable, FastRHT, damage_of, exact_matmul, log, owne
 
 H_MATH = 0.7  # of the windows a stage's input statistics are taken on, the share that are worked solutions
 GATE = 0.1  # --gate-pull: the share of a weight's mean squared gradient that its mean gradient accounts for, from which it is not pulled
+TRELLIS_D_MSE = {1: 0.255057, 2: 0.066477, 3: 0.017222, 4: 0.004469}  # unit-Gaussian MSE of the 1..4 bit e-means trellises
 
 
 def layer_of(name):
     return int(name.split(".layers.")[1].split(".")[0])
+
+
+def solve_equal_byte_reallocation(old_k_map, raw_S_map, cols_map, layer_of_map, gap_kl_raw, max_delta=1):
+    """Solve equal-byte row bit widths k in {1,2,3,4} across trellis matrices.
+    Normalizes each layer's intra-layer scores `raw_S_map` so its estimated error equals its empirical
+    continuous-vs-stored proximal gap `gap_kl_raw[layer]`, eliminating backward-Jacobian depth bias."""
+    layers_present = sorted({layer_of_map[n] for n in old_k_map})
+    pos_vals = [max(float(gap_kl_raw[li]), 0.0) for li in layers_present]
+    mean_gap = sum(pos_vals) / max(1, len(pos_vals))
+    gap_floor = max(0.05 * mean_gap, 1e-8)
+    gap_kl = {li: max(float(gap_kl_raw[li]), gap_floor) for li in layers_present}
+
+    d_tensor = torch.tensor([0.0, TRELLIS_D_MSE[1], TRELLIS_D_MSE[2], TRELLIS_D_MSE[3], TRELLIS_D_MSE[4]], dtype=torch.float64)
+    dd = [TRELLIS_D_MSE[1] - TRELLIS_D_MSE[2], TRELLIS_D_MSE[2] - TRELLIS_D_MSE[3], TRELLIS_D_MSE[3] - TRELLIS_D_MSE[4]]
+
+    names = list(old_k_map)
+    base_bits = 0
+    layer_cur_est = {li: 0.0 for li in layers_present}
+    for n in names:
+        ok = old_k_map[n].long().cpu()
+        assert int(ok.min()) >= 1 and int(ok.max()) <= 4, f"{n}: bit widths must be in 1..4"
+        base_bits += int(ok.sum().item()) * int(cols_map[n])
+        layer_cur_est[layer_of_map[n]] += float((raw_S_map[n].double().cpu() * d_tensor[ok]).sum().item())
+
+    scores_list, cols_list, min_k_list, max_k_list, slices = [], [], [], [], []
+    cursor = 0
+    for n in names:
+        li = layer_of_map[n]
+        ok = old_k_map[n].long().cpu()
+        nrows, ncols = len(ok), int(cols_map[n])
+        scale_l = gap_kl[li] / max(layer_cur_est[li], 1e-30)
+        scores_list.append(raw_S_map[n].double().cpu() * scale_l)
+        cols_list.append(torch.full((nrows,), ncols, dtype=torch.int64))
+        if max_delta > 0:
+            min_k_list.append((ok - max_delta).clamp(min=1))
+            max_k_list.append((ok + max_delta).clamp(max=4))
+        else:
+            min_k_list.append(torch.ones(nrows, dtype=torch.int64))
+            max_k_list.append(torch.full((nrows,), 4, dtype=torch.int64))
+        slices.append((n, cursor, cursor + nrows))
+        cursor += nrows
+
+    S_all = torch.cat(scores_list)
+    C_all = torch.cat(cols_list)
+    min_k = torch.cat(min_k_list)
+    max_k = torch.cat(max_k_list)
+    k_new = min_k.clone()
+    used_bits = int((k_new * C_all).sum().item())
+
+    cand_rows, cand_gains = [], []
+    for step_k in (1, 2, 3):
+        elig = (min_k <= step_k) & (max_k >= step_k + 1)
+        r_idx = torch.nonzero(elig, as_tuple=False).squeeze(1)
+        if len(r_idx):
+            cand_rows.append(r_idx)
+            cand_gains.append((S_all[r_idx] * dd[step_k - 1]) / C_all[r_idx].double())
+    if cand_rows:
+        all_r = torch.cat(cand_rows)
+        all_g = torch.cat(cand_gains)
+        order = torch.argsort(all_g, descending=True, stable=True)
+        sorted_r = all_r[order]
+        sorted_c = C_all[sorted_r]
+        cum_bits = torch.cumsum(sorted_c, dim=0)
+        rem_bits = base_bits - used_bits
+        take_n = int(torch.searchsorted(cum_bits, torch.tensor(rem_bits, dtype=torch.int64), right=True).item())
+        if take_n > 0:
+            chosen = sorted_r[:take_n]
+            k_new.index_add_(0, chosen, torch.ones(len(chosen), dtype=torch.int64))
+            used_bits += int(cum_bits[take_n - 1].item())
+        if used_bits < base_bits:
+            for idx_pos in range(take_n, min(take_n + 4096, len(sorted_r))):
+                r_i = int(sorted_r[idx_pos].item())
+                c_i = int(C_all[r_i].item())
+                if used_bits + c_i <= base_bits and k_new[r_i] < max_k[r_i]:
+                    k_new[r_i] += 1
+                    used_bits += c_i
+    assert used_bits <= base_bits, f"reallocated bits {used_bits} > base {base_bits}"
+
+    new_k_map = {}
+    changed_rows = 0
+    for n, r0, r1 in slices:
+        kn = k_new[r0:r1]
+        new_k_map[n] = kn
+        changed_rows += int((kn != old_k_map[n].long().cpu()).sum().item())
+    return new_k_map, {"base_bits": base_bits, "new_bits": used_bits, "rows_changed": changed_rows, "total_rows": cursor}
 
 
 def main():
@@ -87,17 +176,22 @@ def main():
     ap.add_argument("--lr-table", type=float, default=1e-4, help="Adam step for the embedding's tables")
     ap.add_argument("--lr-rows", type=float, default=1e-5, help="Adam step for the embedding rows kept at 16 bits")
     ap.add_argument("--eval-every", type=int, default=1000)
-    ap.add_argument("--h-windows", type=int, default=256, help="pool windows for the input statistics, 70% worked solutions")
+    ap.add_argument("--h-windows", type=int, default=256, help="pool windows for the input statistics, 70%% worked solutions")
     ap.add_argument("--running-stats", action="store_true")
     ap.add_argument("--gate-pull", action="store_true")
     ap.add_argument("--stats-drift", default="")
     ap.add_argument("--rebuild-at", type=int, default=0)
+    ap.add_argument("--realloc-at", type=int, default=0,
+                    help="at this step (paired with --rebuild-at), re-solve equal-byte row widths from per-layer proximal KL gaps")
+    ap.add_argument("--realloc-batches", type=int, default=32, help="training-mix batches used for intra-layer output Fisher at --realloc-at")
+    ap.add_argument("--realloc-max-delta", type=int, default=1, help="max per-row bit change |k_new - k_old| at --realloc-at (0: uncapped)")
     ap.add_argument("--profile", action="store_true", help="time a step's parts on this GPU (the embedding's rebuild, the batch whole and in halves, each chunk rule, Adam, the pull) and stop")
     ap.add_argument("--fast-delta", action="store_true", help="the linear-attention layers' chunk rule with one triangular solve for its 63-step loop (fast_delta.py)")
     ap.add_argument("--save", default="")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     assert not args.rebuild_at or args.running_stats, "--rebuild-at rounds for the stream as it stands: it needs --running-stats"
+    assert not args.realloc_at or (args.running_stats and args.rebuild_at), "--realloc-at needs --running-stats and --rebuild-at"
     if args.fast_delta:
         fast_delta.install()
     t0 = time.time()
@@ -243,6 +337,142 @@ def main():
         P[n] = stored(n)
 
     original = dict(ref.named_parameters())
+    pending_groups = {}  # populated at --realloc-at and applied to each matrix when its fresh rebuild runs
+
+    def reallocate_rows_equal_byte(step_now):
+        """Measure each layer's continuous-vs-stored proximal KL gap and intra-layer output Fisher,
+        then stage equal-byte row groups in `pending_groups` for the --rebuild-at pass."""
+        t_r = time.time()
+        opt.zero_grad(set_to_none=True)
+        if DEV == "cuda":
+            torch.cuda.empty_cache()
+
+        eval_gen = torch.Generator().manual_seed(909 + step_now)
+        eval_rows = torch.cat([
+            torch.randint(n_math_pool, (16,), generator=eval_gen),
+            n_math_pool + torch.randint(n_text, (16,), generator=eval_gen),
+        ])
+
+        @torch.no_grad()
+        def _pool_kl():
+            tot_kl, tot_w = 0.0, 0.0
+            for part in eval_rows.chunk(4):
+                hid = owner_s(input_ids=pool[part].to(DEV), use_cache=False).last_hidden_state
+                ls = F.log_softmax(head_s(at(hid, sel_pos[part].to(DEV))).float(), -1).flatten(0, 1)
+                per = topk_kl(top_lp[part].to(DEV).flatten(0, 1), top_id[part].to(DEV).long().flatten(0, 1), tail[part].to(DEV).flatten(), ls)
+                w = sel_w[part].to(DEV).flatten()
+                tot_kl += float((per * w).sum().item())
+                tot_w += float(w.sum().item())
+            return tot_kl / max(tot_w, 1e-30)
+
+        layers_present = sorted({layer_of(n) for n in names})
+        by_layer_names = {li: [n for n in names if layer_of(n) == li] for li in layers_present}
+        saved_cont = {n: sp[n].data for n in names}
+        gap_kl_raw = {}
+        try:
+            with torch.no_grad():
+                for n in names:
+                    sp[n].data = P[n]
+                kl_all_P = _pool_kl()
+                for li in layers_present:
+                    for n in by_layer_names[li]:
+                        sp[n].data = saved_cont[n]
+                    gap_kl_raw[li] = kl_all_P - _pool_kl()
+                    for n in by_layer_names[li]:
+                        sp[n].data = P[n]
+        finally:
+            for n in names:
+                sp[n].data = saved_cont[n]
+
+        q_step = max(1, (len(layers_present) + 3) // 4)
+        quarters = [layers_present[q * q_step : (q + 1) * q_step] for q in range(4)]
+        q_gaps = [round(sum(gap_kl_raw.get(l, 0.0) for l in qs), 5) for qs in quarters if qs]
+        log(f"  step {step_now}: continuous-vs-stored layer KL gaps measured in {time.time() - t_r:.1f}s (all-P KL={kl_all_P:.4f}, quarter sums={q_gaps})")
+
+        fisher = {n: torch.zeros(sp[n].shape[0], device=sp[n].device, dtype=torch.float64) for n in names}
+        f_hooks = []
+        for n in names:
+            def _bhook(mod, grad_in, grad_out, name=n):
+                g_out = grad_out[0]
+                if g_out is not None:
+                    fisher[name].add_(g_out.detach().reshape(-1, g_out.shape[-1]).float().square().sum(0).double())
+            f_hooks.append(module(n).register_full_backward_hook(_bhook))
+
+        f_gen = torch.Generator().manual_seed(777 + step_now)
+        try:
+            for _ in range(args.realloc_batches):
+                rows_b = torch.cat([
+                    torch.randint(n_math_pool, (n_m,), generator=f_gen),
+                    n_math_pool + torch.randint(n_text, (args.batch - n_m,), generator=f_gen),
+                ])
+                w_tot = float(sel_w[rows_b].sum())
+                for part in rows_b.chunk(args.split):
+                    hid = owner_s(input_ids=pool[part].to(DEV), use_cache=False).last_hidden_state
+                    ls = F.log_softmax(head_s(at(hid, sel_pos[part].to(DEV))).float(), -1).flatten(0, 1)
+                    per = topk_kl(top_lp[part].to(DEV).flatten(0, 1), top_id[part].to(DEV).long().flatten(0, 1), tail[part].to(DEV).flatten(), ls)
+                    piece = (per * sel_w[part].to(DEV).flatten()).sum() / w_tot
+                    piece.backward()
+                    del hid, ls, per, piece
+                opt.zero_grad(set_to_none=True)
+                if table is not None and sp[emb_name].grad is not None:
+                    sp[emb_name].grad = None
+        finally:
+            for h_ in f_hooks:
+                h_.remove()
+
+        old_k_map, raw_S_map, cols_map, layer_of_map = {}, {}, {}, {}
+        with torch.no_grad():
+            for n in names:
+                nrows, ncols = sp[n].shape
+                ok = torch.empty(nrows, dtype=torch.int64)
+                for g_rows, gk, _ in groups[n]:
+                    ok[g_rows.cpu()] = gk
+                old_k_map[n] = ok
+                cols_map[n] = ncols
+                layer_of_map[n] = layer_of(n)
+                H_cur = (Hs[stage_of[n]] / max(now["seen"], 1e-30)).to(DEV, torch.float32)
+                W0 = original[n].data.to(DEV, torch.float32)
+                row_e = ((W0 @ H_cur) * W0).sum(1).double().clamp_min(1e-30)
+                raw_S_map[n] = (fisher[n] * row_e).cpu().double()
+                del H_cur, W0, row_e
+
+        new_k_map, rstats = solve_equal_byte_reallocation(old_k_map, raw_S_map, cols_map, layer_of_map, gap_kl_raw, max_delta=args.realloc_max_delta)
+        ema_tables = {k: C.trellis_values(12, k, T=256, fit="ema").float() for k in (1, 2, 3, 4)}
+
+        by_layer_old, by_layer_new, by_layer_w = {}, {}, {}
+        for n in names:
+            kn, ko, ncols, li = new_k_map[n], old_k_map[n], cols_map[n], layer_of_map[n]
+            by_layer_old[li] = by_layer_old.get(li, 0) + int(ko.sum().item()) * ncols
+            by_layer_new[li] = by_layer_new.get(li, 0) + int(kn.sum().item()) * ncols
+            by_layer_w[li] = by_layer_w.get(li, 0) + len(kn) * ncols
+            new_g = []
+            for k_val in (1, 2, 3, 4):
+                rows_k = torch.nonzero(kn == k_val, as_tuple=False).squeeze(1)
+                if len(rows_k):
+                    new_g.append((rows_k.to(DEV), k_val, row_code(ema_tables[k_val].to(DEV), k_val)))
+            pending_groups[n] = new_g
+
+        q_old = [sum(by_layer_old[l] for l in qs) / max(1, sum(by_layer_w[l] for l in qs)) for qs in quarters if qs]
+        q_new = [sum(by_layer_new[l] for l in qs) / max(1, sum(by_layer_w[l] for l in qs)) for qs in quarters if qs]
+        res["reallocation"] = {
+            "step": step_now,
+            "seconds": round(time.time() - t_r, 1),
+            "base_bits": rstats["base_bits"],
+            "new_bits": rstats["new_bits"],
+            "base_bpp": round(rstats["base_bits"] / n_weights, 5),
+            "new_bpp": round(rstats["new_bits"] / n_weights, 5),
+            "rows_changed_frac": round(rstats["rows_changed"] / max(1, rstats["total_rows"]), 4),
+            "quarter_old_bpp": [round(x, 3) for x in q_old],
+            "quarter_new_bpp": [round(x, 3) for x in q_new],
+            "quarter_gap_kl": q_gaps,
+            "layer_gap_kl": {str(li): round(gap_kl_raw[li], 6) for li in layers_present},
+        }
+        log(f"  step {step_now}: equal-byte reallocation done in {time.time() - t_r:.1f}s: "
+            f"{rstats['new_bits']/n_weights:.5f} vs {rstats['base_bits']/n_weights:.5f} bpp "
+            f"({rstats['rows_changed']/max(1, rstats['total_rows']):.1%} rows moved); "
+            f"quarters {[round(x, 2) for x in q_old]} -> {[round(x, 2) for x in q_new]}")
+        if DEV == "cuda":
+            torch.cuda.empty_cache()
 
     def project(which, share=1.0, fresh=False):
         """P of these matrices' current weights: every row, or the `share` of each matrix's rows furthest from their stored
@@ -263,6 +493,8 @@ def main():
                     apart = [apart[0] + float((e.H / e.H.diagonal().sum() - h0).pow(2).sum()), apart[1] + float(h0.pow(2).sum())]
                     del h0
                 for n in mine:
+                    if fresh and n in pending_groups:
+                        groups[n] = pending_groups.pop(n)
                     W, old = (original[n].data.to(DEV) if fresh else sp[n].data), P[n]
                     rows = None
                     if share < 1:
@@ -554,6 +786,8 @@ def main():
         if step in (1, 5, 25) or step % 100 == 0:
             mem = f", {torch.cuda.max_memory_allocated() / 1e9:.0f} GB peak" if DEV == "cuda" else ""
             log(f"  step {step}: train loss {running:.5f}, beta {beta:.4g}, {t_train / step:.2f} s/step ({args.batch * args.len / (t_train / step):.0f} tokens/s){mem} ({time.time() - t0:.0f}s)")
+        if args.realloc_at and step == args.realloc_at:
+            reallocate_rows_equal_byte(step)
         if step < args.steps and step % args.project_every == 0:
             opt.zero_grad(set_to_none=True)
             t_p, g = time.time(), (step // args.project_every - 1) % args.project_groups

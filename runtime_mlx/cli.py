@@ -33,6 +33,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser, *, default_max_tokens: in
     parser.add_argument("--no-verify", action="store_true", help="skip SHA-256 checksum verification when loading")
     parser.add_argument("--full-vocab", action="store_true", help="score the full vocabulary for drafter proposals")
     parser.add_argument("--dense-drafter", action="store_true", help="keep drafter weights dense float16 instead of 8-bit rows")
+    parser.add_argument("--no-adaptive", action="store_true", help="disable adaptive serial fallback when drafter acceptance drops")
     parser.add_argument("--stats", action="store_true", help="print throughput and acceptance statistics to stderr")
 
 
@@ -53,6 +54,8 @@ def _format_stats(last) -> str:
     ]
     if last.tokens_per_check is not None:
         parts.append(f"tok/check={last.tokens_per_check:.2f}")
+    if last.stats and last.stats.get("serial_steps"):
+        parts.append(f"serial={last.stats['serial_steps']}")
     if last.finish_reason:
         parts.append(f"stop={last.finish_reason}")
     return " | ".join(parts)
@@ -78,6 +81,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             top_p=args.top_p,
             mode=args.mode,
             block_size=args.block_size,
+            adaptive=not args.no_adaptive,
         )
         print(
             json.dumps(
@@ -108,6 +112,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         top_p=args.top_p,
         mode=args.mode,
         block_size=args.block_size,
+        adaptive=not args.no_adaptive,
     ):
         if chunk.text:
             sys.stdout.write(chunk.text)
@@ -153,6 +158,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 top_p=args.top_p,
                 mode=args.mode,
                 block_size=args.block_size,
+                adaptive=not args.no_adaptive,
             ):
                 if chunk.text:
                     sys.stdout.write(chunk.text)

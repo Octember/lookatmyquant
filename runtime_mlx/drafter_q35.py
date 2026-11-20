@@ -380,9 +380,10 @@ def _prefill(model, block, prompt, cache, taps):
     return first, got
 
 
-def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear", stats_out=None):
+def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear", adaptive=True, stats_out=None):
     """Yield lists of accepted greedy token IDs as each round finishes. If `stats_out` is a dict, it is
-    populated with the run's timing and acceptance statistics when iteration finishes."""
+    populated with the run's timing and acceptance statistics when iteration finishes. With `adaptive=True`
+    (the default in linear mode), low rolling acceptance temporarily falls back to exact serial decoding."""
     if mode not in ("linear", "chat-fork", "copy-wide"):
         raise ValueError(f"unknown drafter mode: {mode}")
     if mode != "linear" and (size != 8 or drafter.path):
@@ -390,7 +391,7 @@ def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="l
     if max_tokens <= 0:
         if stats_out is not None:
             stats_out.update({"rounds": 0, "kept": [], "round_ms": [], "prompt_s": 0.0, "drafter_prompt_s": 0.0,
-                              "rounds_s": 0.0, "tokens": 0, "tokens_per_check": 0.0})
+                              "rounds_s": 0.0, "tokens": 0, "tokens_per_check": 0.0, "serial_steps": 0})
         return
     old = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     proposal_head = drafter.proposal_head
@@ -398,7 +399,7 @@ def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="l
         if proposal_head is not None and not proposal_head.covers_prompt(prompt):
             drafter.proposal_head = None
         if mode == "linear" and _generate is _generate_linear:
-            yield from _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, stats_out=stats_out)
+            yield from _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, adaptive=adaptive, stats_out=stats_out)
             return
         if mode == "linear":
             tokens, stats = _generate(model, block, drafter, prompt, max_tokens, size, eos)
@@ -430,7 +431,7 @@ def stream(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="l
         mx.set_wired_limit(old)
 
 
-def generate(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear"):
+def generate(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode="linear", adaptive=True):
     """Greedy text from the target with the drafter proposing blocks of `size`. Returns the tokens and a record of the
     run: rounds, tokens kept per round, and seconds (the prompt, the drafter's reading of it, the rounds).
     Use mode="chat-fork" for an eight-slot verifier with one alternate branch, or mode="copy-wide" for
@@ -438,13 +439,13 @@ def generate(model, block, drafter, prompt, max_tokens, size=8, eos=(), *, mode=
     Memory is wired for the run as mlx_lm's own generation wires it (a run that follows one of mlx_lm's without this
     measured 25 to 30 ms a round against 22.7)."""
     out, stats = [], {}
-    for chunk in stream(model, block, drafter, prompt, max_tokens, size, eos, mode=mode, stats_out=stats):
+    for chunk in stream(model, block, drafter, prompt, max_tokens, size, eos, mode=mode, adaptive=adaptive, stats_out=stats):
         out.extend(chunk)
     return out[:max_tokens], stats
 
 
 def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
-                 copy_index=None, wide_index=None, deferred_context=None, stats_out=None):
+                 copy_index=None, wide_index=None, deferred_context=None, adaptive=True, stats_out=None):
     eos, cache = set(eos), model.make_cache()
     t0 = time.perf_counter()
     first, got = _prefill(model, block, prompt, cache, drafter.taps)
@@ -459,11 +460,15 @@ def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
         if wide_index is not None:
             wide_index.seed(prompt, first_id)
     t2 = time.perf_counter()
-    out, anchor, rounds, times = [first_id], first, [], [t2]
+    out, anchor, rounds, round_ms = [first_id], first, [], []
+    adaptive_on = bool(adaptive) and copy_index is None and deferred_context is None
+    window, probe_rounds, cool_tokens = 8, 3, 24
+    need_rounds, since_serial, cur_cool, serial_steps = window, 0, cool_tokens, 0
     try:
         yield [first_id]
         drafter.torn = False
         while len(out) < max_tokens and out[-1] not in eos:
+            t_r0 = time.perf_counter()
             p = copy_index.proposals() if copy_index is not None else None
             copied = p is not None
             ordinary_wide = False
@@ -497,6 +502,7 @@ def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
             prev_len = len(out)
             out += emitted
             rounds.append(kept)
+            since_serial += 1
             finished = len(out) >= max_tokens or out[-1] in eos
             if copy_index is not None:
                 first_rejected = p[0] != t[0] if copied else None
@@ -505,10 +511,96 @@ def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
                 wide_index.observe(emitted, len(rounds) - 1, first_rejected if width == 16 else None,
                                    finished, reject_key=ordinary_wide)
             if finished:
-                times.append(time.perf_counter())
+                round_ms.append(round((time.perf_counter() - t_r0) * 1e3, 2))
                 yield emitted[: max_tokens - prev_len]
                 break
             block.commit(cache, kept)
+            anchor = own[a]
+            drafter.torn = kept < width
+
+            # Self-calibrating adaptive fallback: trigger only when rolling acceptance sits below
+            # the net break-even ratio (draft_ms / serial_ms) discounted for flush + context replay cost.
+            fall_back = False
+            burst_len = 0
+            if adaptive_on and since_serial >= need_rounds:
+                k_win = min(window, since_serial)
+                recent_mean = sum(rounds[-k_win:]) / k_win
+                serial_ms = getattr(block, "_serial_step_ms", None)
+                trans_ms = getattr(block, "_serial_trans_ms", 0.0)
+                if serial_ms is None:
+                    if recent_mean < 2.2:
+                        fall_back, burst_len = True, 12            # brief probe to measure serial + transition latency once
+                else:
+                    s_ms = sorted(round_ms + [round((time.perf_counter() - t_r0) * 1e3, 2)])
+                    draft_ms = s_ms[len(s_ms) // 2]
+                    net_be = (draft_ms / max(serial_ms, 1e-3)) / (1.0 + trans_ms / max(cool_tokens * serial_ms, 1e-3))
+                    low_thresh = max(1.25, min(float(size - 1), 0.85 * net_be))
+                    if recent_mean < low_thresh:
+                        fall_back, burst_len = True, cur_cool
+                    elif need_rounds == probe_rounds:
+                        cur_cool = cool_tokens                     # acceptance recovered: reset backoff
+
+            if fall_back:
+                round_ms.append(round((time.perf_counter() - t_r0) * 1e3, 2))
+                yield emitted[: max_tokens - prev_len]
+                # Flush the block verifier's deferred recurrent state before 1-token serial steps.
+                t_fl0 = time.perf_counter()
+                block.flush(cache)
+                buf_taps = {i: [taps[i][:kept]] for i in drafter.taps}
+                burst = min(burst_len, max_tokens - len(out))
+                burst_done = 0
+                step_ms = []
+                got_s = set_taps(model, drafter.taps)
+                try:
+                    t_step = time.perf_counter()
+                    nxt = mx.argmax(model(anchor.reshape(1, 1), cache=cache)[0, -1])
+                    mx.async_eval(nxt)
+                    for step_i in range(burst):
+                        if step_i + 1 < burst:
+                            nxt2 = mx.argmax(model(nxt.reshape(1, 1), cache=cache)[0, -1])
+                            mx.async_eval(nxt2)
+                        else:
+                            nxt2 = None
+                        mx.eval(nxt)
+                        t_now = time.perf_counter()
+                        step_ms.append((t_now - t_step) * 1e3)
+                        t_step = t_now
+                        nid = int(nxt)
+                        out.append(nid)
+                        serial_steps += 1
+                        burst_done += 1
+                        anchor = nxt
+                        yield [nid]
+                        if len(out) >= max_tokens or nid in eos:
+                            if nxt2 is not None:
+                                mx.eval(nxt2)
+                            break
+                        nxt = nxt2
+                finally:
+                    set_taps(model, ())
+                if len(step_ms) >= 4:
+                    steady = sorted(step_ms[1:])
+                    s_med = steady[len(steady) // 2]
+                    block._serial_step_ms = s_med
+                    flush_over_ms = max(0.0, step_ms[0] - s_med + (t_step - t_fl0) * 1e3 - sum(step_ms))
+                else:
+                    flush_over_ms = 0.0
+                if len(out) >= max_tokens or out[-1] in eos:
+                    break
+                t_ctx0 = time.perf_counter()
+                merged = [mx.concatenate(buf_taps[i] + [x[0] for x in got_s[i][:burst_done]], axis=0) for i in drafter.taps]
+                drafter.context(merged)
+                mx.eval([c.state for c in drafter.cache])
+                ctx_ms = (time.perf_counter() - t_ctx0) * 1e3
+                if len(step_ms) >= 4:
+                    block._serial_trans_ms = flush_over_ms + ctx_ms
+                drafter.torn = True
+                since_serial = 0
+                need_rounds = probe_rounds
+                if burst_len == cur_cool:
+                    cur_cool = min(96, cur_cool * 2)
+                continue
+
             accepted_taps = [taps[i][:kept] for i in drafter.taps]
             if deferred_context is None:
                 drafter.context(accepted_taps)
@@ -517,24 +609,22 @@ def _iter_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
                 projected = deferred_context.push(drafter, accepted_taps, defer=copied)
             if OVERLAP and projected:                              # project context while Python lists the next draft
                 mx.async_eval([x for c in drafter.cache for x in (c.keys, c.values)])   # the buffers themselves: a cache's .state is a copy
-            anchor = own[a]
-            drafter.torn = kept < width
-            times.append(time.perf_counter())
+            round_ms.append(round((time.perf_counter() - t_r0) * 1e3, 2))
             yield emitted[: max_tokens - prev_len]
     finally:
         t3 = time.perf_counter()
         out = out[:max_tokens]
         if stats_out is not None:
-            stats_out.update({"rounds": len(rounds), "kept": rounds, "round_ms": [round((y - x) * 1e3, 2) for x, y in zip(times, times[1:])], "prompt_s": t1 - t0, "drafter_prompt_s": t2 - t1, "rounds_s": t3 - t2,
-                              "tokens": len(out), "tokens_per_check": (len(out) - 1) / max(1, len(rounds))})
+            stats_out.update({"rounds": len(rounds), "kept": rounds, "round_ms": round_ms, "prompt_s": t1 - t0, "drafter_prompt_s": t2 - t1, "rounds_s": t3 - t2,
+                              "tokens": len(out), "tokens_per_check": sum(rounds) / max(1, len(rounds)), "serial_steps": serial_steps})
 
 
 def _generate_linear(model, block, drafter, prompt, max_tokens, size, eos, *,
-                     copy_index=None, wide_index=None, deferred_context=None):
+                     copy_index=None, wide_index=None, deferred_context=None, adaptive=True):
     out, stats = [], {}
     for chunk in _iter_linear(model, block, drafter, prompt, max_tokens, size, eos,
                               copy_index=copy_index, wide_index=wide_index,
-                              deferred_context=deferred_context, stats_out=stats):
+                              deferred_context=deferred_context, adaptive=adaptive, stats_out=stats):
         out.extend(chunk)
     return out[:max_tokens], stats
 

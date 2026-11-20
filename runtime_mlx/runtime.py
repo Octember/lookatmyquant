@@ -361,6 +361,7 @@ class Runtime:
         mode: str = "linear",
         block_size: int = 8,
         use_drafter: bool = True,
+        adaptive: bool = True,
     ) -> Iterator[Chunk]:
         """Stream generated chunks for pre-encoded prompt token IDs."""
         ids = _unwrap_ids(prompt_ids)
@@ -387,6 +388,7 @@ class Runtime:
                 size=block_size,
                 eos=eos,
                 mode=mode,
+                adaptive=adaptive,
                 stats_out=stats,
             ):
                 kept: list[int] = []
@@ -461,6 +463,7 @@ class Runtime:
         mode: str = "linear",
         block_size: int = 8,
         use_drafter: bool = True,
+        adaptive: bool = True,
     ) -> Iterator[Chunk]:
         """Encode a prompt and stream output chunks."""
         ids = self.encode_prompt(
@@ -477,6 +480,7 @@ class Runtime:
             mode=mode,
             block_size=block_size,
             use_drafter=use_drafter,
+            adaptive=adaptive,
         )
 
     def stream_chat(
@@ -490,6 +494,7 @@ class Runtime:
         mode: str = "linear",
         block_size: int = 8,
         use_drafter: bool = True,
+        adaptive: bool = True,
     ) -> Iterator[Chunk]:
         """Encode a chat message list and stream output chunks."""
         ids = self.encode_messages(messages, thinking=thinking)
@@ -501,6 +506,7 @@ class Runtime:
             mode=mode,
             block_size=block_size,
             use_drafter=use_drafter,
+            adaptive=adaptive,
         )
 
     def _collect(self, chunks: Iterator[Chunk]) -> GenerationResult:
@@ -538,6 +544,7 @@ class Runtime:
         mode: str = "linear",
         block_size: int = 8,
         use_drafter: bool = True,
+        adaptive: bool = True,
     ) -> GenerationResult:
         """Generate a complete response for a prompt string or token IDs."""
         return self._collect(
@@ -552,6 +559,7 @@ class Runtime:
                 mode=mode,
                 block_size=block_size,
                 use_drafter=use_drafter,
+                adaptive=adaptive,
             )
         )
 
@@ -566,6 +574,7 @@ class Runtime:
         mode: str = "linear",
         block_size: int = 8,
         use_drafter: bool = True,
+        adaptive: bool = True,
     ) -> GenerationResult:
         """Generate a complete response for a list of chat messages."""
         return self._collect(
@@ -578,5 +587,6 @@ class Runtime:
                 mode=mode,
                 block_size=block_size,
                 use_drafter=use_drafter,
+                adaptive=adaptive,
             )
         )

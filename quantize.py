@@ -365,6 +365,34 @@ def frequency_order(ids, V):
 
 
 @torch.no_grad()
+def softmax_fisher(model, chunks):
+    """Per-vocabulary output Fisher E[p_v (1 - p_v)] over next-token positions of the calibration chunks."""
+    V = model.get_output_embeddings().weight.shape[0]
+    acc = torch.zeros(V, dtype=torch.float64)
+    for x in chunks:
+        p = torch.softmax(model(x, use_cache=False).logits[:, :-1].float(), dim=-1)
+        acc.add_((p * (1.0 - p)).double().sum(dim=(0, 1)).cpu())
+    return acc / acc.sum().clamp_min(1e-30)
+
+
+def token_importance(freq, sfisher=None, mode="freq"):
+    """Per-token importance score for bucketing a token table.
+    `freq`: unigram frequency only; `sfisher`: output Softmax-Fisher E[p(1-p)] only (untied output head);
+    `sfisher-mix`: 50/50 blend of normalized Softmax-Fisher and normalized frequency (tied embed/head)."""
+    f = freq.double()
+    f_norm = f / f.sum().clamp_min(1e-30)
+    if mode == "freq" or sfisher is None:
+        return f_norm
+    sf = sfisher.double()
+    sf_norm = sf / sf.sum().clamp_min(1e-30)
+    if mode == "sfisher":
+        return sf_norm
+    if mode == "sfisher-mix":
+        return 0.5 * sf_norm + 0.5 * f_norm
+    raise ValueError(f"unknown embed order mode: {mode!r}")
+
+
+@torch.no_grad()
 def head_inputs(model, chunks):
     """E[h hᵀ] of the output head's input (the final normed hidden state) on the calibration chunks."""
     acc = []
@@ -956,6 +984,8 @@ def main():
     ap.add_argument("--gauge-alphas", default="0,0.25,0.5", help="the exponents tried (0 = no rewrite)")
     ap.add_argument("--seeds", type=int, default=1, help="randomized Hadamard seeds tried per matrix (tr, lm)")
     ap.add_argument("--data", choices=["wikitext", "mix"], default="wikitext", help="calibration text (and token frequencies)")
+    ap.add_argument("--embed-order", choices=["", "freq", "sfisher-mix", "sfisher"], default="",
+                    help="override how token table rows are ranked into buckets (default: follow the plan's order)")
     ap.add_argument("--eval-mix", type=int, default=0, help="held-out windows per text-mix source to evaluate (0: 8 with --data mix)")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     ap.add_argument("--stream-cancel", type=float, default=0.0, help="cross-term programs: fit the last matrix of each residual branch to also cancel this share of the error already in the stream")
@@ -1254,23 +1284,33 @@ def main():
         t0 = time.time()
         V = emb.weight.shape[0]
         spec = plan.get("embed") or plan.get("head") or plan.get("ple")
-        freq = (mix or A.TextMix(tok, tag)).frequency(V) if "mix" in spec.get("order", "") else torch.bincount(token_ids(tok, "train", tag).reshape(-1), minlength=V)[:V].double()
-        if spec.get("special first"):  # chat markers rarely appear in the text the frequencies count
-            freq = freq.clone()
-            freq[sorted(tok.added_tokens_decoder)] = math.inf
-        order = torch.sort(-freq, stable=True).indices
+        order_text = spec.get("order", "")
+        emb_mode = args.embed_order or ("sfisher-mix" if "sfisher-mix" in order_text else "sfisher" if "sfisher" in order_text else "freq")
+        freq = (mix or A.TextMix(tok, tag)).frequency(V) if "mix" in order_text else torch.bincount(token_ids(tok, "train", tag).reshape(-1), minlength=V)[:V].double()
+        sf = softmax_fisher(ref, chunks) if emb_mode != "freq" else None
+
+        def _order_for(mode_name, table_spec):
+            score = token_importance(freq, sf, mode_name)
+            if table_spec.get("special first"):  # chat markers rarely appear in the text the frequencies count
+                score = score.clone()
+                score[sorted(tok.added_tokens_decoder)] = math.inf
+            return torch.sort(-score, stable=True).indices
+
         H_out = head_inputs(ref, chunks)
         if plan.get("embed"):
             pname = {id(p_): n for n, p_ in model.named_parameters()}
-            b_, n_ = quantize_embedding(emb.weight, plan["embed"], embedding_environment(H_out, "both" if tied else "lookup"), order, name=pname[id(emb.weight)])
+            ord_emb = _order_for(emb_mode if tied else ("freq" if emb_mode == "sfisher" else emb_mode), plan["embed"])
+            b_, n_ = quantize_embedding(emb.weight, plan["embed"], embedding_environment(H_out, "both" if tied else "lookup"), ord_emb, name=pname[id(emb.weight)])
             bits_e, n_e = bits_e + b_, n_e + n_
         if plan.get("head") and not tied:
-            b_, n_ = quantize_embedding(head.weight, plan["head"], embedding_environment(H_out, "head"), order, seed0=8000,
+            ord_head = _order_for("sfisher" if emb_mode != "freq" else "freq", plan["head"])
+            b_, n_ = quantize_embedding(head.weight, plan["head"], embedding_environment(H_out, "head"), ord_head, seed0=8000,
                                         name={id(p_): n for n, p_ in model.named_parameters()}[id(head.weight)])
             bits_e, n_e = bits_e + b_, n_e + n_
         if plan.get("ple"):  # Gemma 4's per-layer input table: lookup only
             ple = A.per_layer_embedding(model)
-            b_, n_ = quantize_embedding(ple.weight, plan["ple"], None, order, seed0=9000, center=args.ple_center, block=A.text_config(ref.config).hidden_size_per_layer_input,
+            ord_ple = _order_for("freq", plan["ple"])
+            b_, n_ = quantize_embedding(ple.weight, plan["ple"], None, ord_ple, seed0=9000, center=args.ple_center, block=A.text_config(ref.config).hidden_size_per_layer_input,
                                         name={id(p_): n for n, p_ in model.named_parameters()}[id(ple.weight)])
             bits_e, n_e = bits_e + b_, n_e + n_
         log(f"  embedding{'' if tied else ' and head'}{' and per-layer table' if plan.get('ple') else ''}: {bits_e / n_e:.3f} bits/weight ({time.time() - t0:.0f}s)")

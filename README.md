@@ -44,7 +44,7 @@ lamq chat shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
     --drafter shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter
 ```
 
-`lamq generate` reads stdin when `-p` is omitted, supports `--raw`, `--system`, `--thinking`, `--temp`, `--mode linear|chat-fork|copy-wide`, and `--json`. `lamq info <model>` inspects a packed model's format and dimensions without loading weights.
+`lamq generate` reads stdin when `-p` is omitted, supports `--raw`, `--system`, `--thinking`, `--temp`, `--mode linear|chat-fork|copy-wide`, `--no-adaptive`, and `--json`. `lamq info <model>` inspects a packed model's format and dimensions without loading weights.
 
 **Python integration.** `runtime_mlx.load` returns an `(model, tokenizer)` pair compatible with `mlx_lm.generate` and `mlx_lm.stream_generate` (auto-detecting `opgraph-packed-1` models such as Qwen3.5-4B / Qwen3.8-27B and `lamq.json` exports such as Gemma 4 E2B):
 
@@ -136,6 +136,11 @@ modal run --detach modal_app.py --jobs lm2Math,lm2Math216,lm2TextKL
 
 **The codebooks.** The four e-means codebooks the build decodes with are in `cache/codes/`. `--trellis-fit lloyd` gives the earlier ones, and a plan made before the change keeps them unless the flag says otherwise.
 
+**Recent equal-byte recipe improvements.** Two zero-byte additions are available in the compiler and fine-tuning scripts:
+
+- **Softmax-Fisher token table ranking (`--embed-order sfisher-mix` in `compiler.py measure` and `quantize.py`).** Ranks tied embedding/output buckets by a 50/50 blend of output Softmax-Fisher `E[p_v (1 - p_v)]` and corpus frequency (and untied output heads by Softmax-Fisher alone).
+- **Mid-training equal-byte row reallocation (`--realloc-at 1000` in `finetune.py`).** Paired with `--rebuild-at 1000`, measures each layer's continuous-vs-stored proximal KL gap `KL(all P) - KL(layer = W)` to shift bits toward deep unabsorbed layers while keeping exact file size (`--realloc-max-delta 1`). Combined with `sfisher-mix` on Qwen3.5-4B at identical 1.23 GB (`2.297 bpp`), WikiText-2 KL fell from 0.425 to 0.387 (−9.0%) and 13-source KL from 0.447 to 0.378 (−15.5%, improving all 13 sources).
+
 **Where these jobs differ from our run.** Our GSM8K solutions were written earlier, with thinking always off. Our text KL on 13 sources used 52 windows picked from the text mix by a separate tool; `--sources mix` takes the mix's own evaluation windows, on which our file scores 0.44 where the page reports 0.45.
 
 ## Large models run on Modal, one GPU per job
@@ -175,7 +180,7 @@ python runtime_mlx/bench.py lamq path/to/export
 
 On an M5 Max, over 30 held-out prompts of up to 256 tokens, generation with the drafter was 2.0 times as fast: 176 tokens a second against 88, timed in alternation in one process on 2026-11-11. A check kept 4.3 tokens on average. Over eight everyday prompts it was 1.5 times as fast. The gain follows how predictable the text is: 2.5 times on algebra, 2.0 on code, 1.2 on chat and 1.05 on a story, and one of the 30 held-out prompts ran slower with the drafter. The text matched plain greedy decoding on every prompt. These are speeds after the first token; reading the prompt takes about 0.1 s either way.
 
-Two later changes are in this code. Each was measured against the version before it on 40 paired generations: proposing from the 96,033 most common tokens was 6.0% faster, and picking the winning token inside the packed product was 5.3% faster.
+Two later changes are in this code. Each was measured against the version before it on 40 paired generations: proposing from the 96,033 most common tokens was 6.0% faster, and picking the winning token inside the packed product was 5.3% faster. Linear mode also enables self-calibrating adaptive fallback by default (`adaptive=True`; pass `--no-adaptive` to disable): when rolling acceptance drops below the measured break-even ratio of drafted-check latency to serial-step latency (accounting for cache flush and drafter context replay), it pauses drafting for short exact serial bursts and resumes once acceptance recovers, preserving bit-exact greedy parity while avoiding slowdowns on low-acceptance prose.
 
 The drafter is a DSpine model, trained with [SpecForge](https://github.com/sgl-project/SpecForge) from the published DFlash drafter for Qwen3.5-4B on the 1.2 GB file's own greedy answers. `modal_drafter.py` runs the training as one Modal job, and it cost $42. On 300 held-out prompts the trained drafter gets 4.65 tokens per check, against 4.30 for the stock DFlash drafter.
 
@@ -238,7 +243,7 @@ python pack_drafter.py path/to/drafter path/to/drafter-4bit
 
 ## The tests need SmolLM2-360M and WikiText-2
 
-Each test file runs on its own from the repository root, and all six finish in under a minute.
+Each test file runs on its own from the repository root, and all seven finish in under a minute.
 
 ```sh
 python tests/test_frame.py
@@ -247,6 +252,7 @@ python tests/test_codes.py
 python tests/test_elements.py
 python tests/test_nested.py
 python tests/test_rowgroup_alloc.py
+python tests/test_reallocation.py
 ```
 
 `runtime_mlx/test_core.py` checks the runtime against the quantizer's math. Run `python runtime_mlx/make_ref.py` first, which writes 1.6 GB of reference files.

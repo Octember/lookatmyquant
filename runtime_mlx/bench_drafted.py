@@ -78,11 +78,12 @@ def main():
     ap.add_argument("--select", action="store_true", help="the drafter proposes by path selection")
     ap.add_argument("--dense", action="store_true", help="the drafter's matrices dense at 16 bits (default: its block-only ones as 8-bit rows)")
     ap.add_argument("--full-vocab", action="store_true", help="score the whole vocabulary for proposals as well as verification")
+    ap.add_argument("--no-adaptive", action="store_true", help="disable adaptive serial fallback on low-acceptance prompts")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     if args.mode != "linear" and (args.size != 8 or args.select):
         ap.error(f"--mode {args.mode} requires --size 8 and greedy proposals")
-    generate = partial(drafter_q35.generate, mode=args.mode)
+    generate = partial(drafter_q35.generate, mode=args.mode, adaptive=not args.no_adaptive)
     model, tok, blk, drafter = drafter_q35.load(
         args.packed, args.drafter, dtype=getattr(mx, args.dtype), bits=args.bits or None,
         select=args.select, int8=not args.dense, full_vocab=args.full_vocab,
