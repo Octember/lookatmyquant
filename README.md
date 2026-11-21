@@ -20,6 +20,23 @@ The same recipe takes Qwen3.8-27B from 53.7 GB to 7.2 GB, 2.1 bits per weight, c
 
 Beside it sits [a 4-bit DSpine drafter](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter) (1.02 GB, converted from `tencent/Qwen3.8-27B-DSpine-b16` with `runtime_mlx/convert_dspine.py` and packed with `pack_drafter.py`), which roughly doubles decode speed on math and code on Apple silicon.
 
+## Inkling-2-Mini in 5.4 GB and 8.9 GB
+
+The same compiler and proximal fine-tuning (`SQYFR`), extended to a 26.4B physical / 5.4B active 3×-looped MoE (`L6–17` looped 3× = 48 logical visits, 128 experts top-8), compresses [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from 18.89 GB of text weights to **[5.38 GB (`1.63` bits/weight)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB)** and **[8.87 GB (`2.69` bits/weight)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB)** using 4 KB SRAM hashed block-vector trellis codes (`ht2`/`ht3`), row trellis codes (`rtr1`/`rtr4`), and a `tr2` floor on the tail `lm_head` bucket (`head.7`).
+
+Evaluated on the same BF16 teacher, `openai/gsm8k` (`test[:200]`, greedy, `reasoning_effort="none"`), all `164` executable `openai/openai_humaneval` problems, `4` Vision VQA tests (with the untouched 637 MB BF16 vision tower), and 16+13-language TextMix windows:
+
+| Model | Text GB | `free_KL` (`en/chat/code`) | `all13_KL` | GSM8K (200) | HumanEval (164) | Pooled vs Teacher |
+|---|---:|---:|---:|---:|---:|---:|
+| **Original BF16 Teacher** | 18.89 | 0.0000 | 0.0000 | 147 / 200 (73.5%) | 66 / 164 (40.2%) | 100.0% |
+| **LookAtMyQuant 5.4 GB (`SQYFR`)** | **5.38** | **0.0895** | 0.2871 | **134 / 200 (67.0%)** | **60 / 164 (36.6%)** | **91.2%** |
+| Unsloth `UD-IQ1_S` | 7.76 | 0.0808 | 0.1236 | 127 / 200 (63.5%) | 46 / 164 (28.0%) | 81.6% |
+| **LookAtMyQuant 8.9 GB (`SQYFR`)** | **8.87** | **0.0208** | **0.0571** | **148 / 200 (74.0%)** | **58 / 164 (35.4%)** | **96.8%** |
+| Unsloth `UD-Q2_K_XL` | 9.14 | 0.0486 | 0.0811 | 132 / 200 (66.0%) | 49 / 164 (29.9%) | 85.3% |
+| Unsloth `UD-IQ3_XXS` | 11.66 | 0.0189 | 0.0278 | 148 / 200 (74.0%) | 68 / 164 (41.5%) | 101.4% |
+
+At **5.38 GB**, `Inkling-2-Mini-LookAtMyQuant-5.4GB` outscores Unsloth's 9.14 GB `UD-Q2_K_XL` on both GSM8K and HumanEval at 41% smaller size (up from 76/200 and 24/164 untuned). At **8.87 GB**, `Inkling-2-Mini-LookAtMyQuant-8.9GB` matches the BF16 original on GSM8K and cuts KL `2.34×` on English/chat/code and `29.6%` across all 13 languages below `UD-Q2_K_XL`. Both run directly through `lamq` and `runtime_mlx`, optionally paired with the 178.9 MB [4-bit DSpark block-8 drafter](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter) (`27.1 tok/s` serial → `38.3 tok/s` median / `46.8 tok/s` peak on M5 Max).
+
 ## Install and use the Apple Silicon runtime
 
 On Apple silicon, install the runtime package directly (this installs `mlx`, `mlx-lm`, `numpy`, and `huggingface-hub` without the PyTorch compiler dependencies):
@@ -42,6 +59,10 @@ lamq generate shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
 
 lamq chat shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB \
     --drafter shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter
+
+lamq generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB \
+    --drafter shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter \
+    -p "What is 17 times 23? Show the steps." --stats
 ```
 
 `lamq generate` reads stdin when `-p` is omitted, supports `--raw`, `--system`, `--thinking`, `--temp`, `--mode linear|chat-fork|copy-wide`, `--no-adaptive`, and `--json`. `lamq info <model>` inspects a packed model's format and dimensions without loading weights.
@@ -227,6 +248,7 @@ python pack_drafter.py path/to/drafter path/to/drafter-4bit
 | `pyproject.toml`, `runtime_mlx/runtime.py`, `runtime_mlx/cli.py` | Installable Apple Silicon runtime package, unified `load`/`Runtime` Python API, and `lamq` CLI |
 | `lamq_export.py`, `runtime_mlx/` | The export format and the Apple Silicon runtime |
 | `runtime_mlx/fast_q35.py`, `block_q35.py`, `block_argmax_q35.py`, `pack_dense.py`, `modal_pack.py` | The runtime for packed Qwen3.5-4B and Qwen3.8-27B files: one token at a time, a block of 8 or 16 tokens in one pass, and the packer |
+| `runtime_mlx/inkling/`, `runtime_mlx/test_inkling.py` | Apple Silicon MLX runtime, 4 KB SRAM `ht2`/`ht3` Metal kernels, and 4-bit DSpark block-8 speculative drafter for packed Inkling-2-Mini models |
 | `runtime_mlx/drafter_q35.py`, `draft_vocab_q35.py`, `convert_dspine.py`, `check_drafter.py`, `bench_drafted.py`, `drafter/`, `modal_drafter.py`, `pack_drafter.py` | Speculative decoding with a DSpine drafter, Tencent DSpine conversion, drafter training, and the drafter stored at 4 bits |
 | `opgraph/` | The grammar: a model as a tensor network, and the rewrites and codes that act on it |
 | `run_completeness.py`, `make_report.py` | The check that nine published methods are reproduced exactly |

@@ -81,10 +81,14 @@ def detect_format(path: str | Path) -> str:
     directory = Path(path)
     if (directory / "artifact.json").exists():
         return "opgraph-packed-1"
+    if (directory / "manifest.json").exists():
+        manifest = json.loads((directory / "manifest.json").read_text())
+        if str(manifest.get("format", "")).startswith("inkling2-packed"):
+            return "inkling2-packed"
     if (directory / "lamq.json").exists():
         return "lamq"
     raise FileNotFoundError(
-        f"no artifact.json or lamq.json found in {directory}"
+        f"no artifact.json, manifest.json (inkling2-packed), or lamq.json found in {directory}"
     )
 
 
@@ -111,6 +115,18 @@ def inspect_model(path_or_repo: str | Path) -> dict[str, Any]:
         info["separate_lm_head"] = any(
             name.endswith("lm_head.weight") for name in matrices
         )
+    elif fmt == "inkling2-packed":
+        manifest = json.loads((directory / "manifest.json").read_text())
+        info["manifest_format"] = manifest.get("format")
+        info["packed_bytes"] = sum(
+            f.stat().st_size for f in directory.iterdir() if f.is_file() and f.name != "README.md"
+        )
+        info["packed_text_gb"] = manifest.get("packed_text_gb")
+        info["n_routed_experts"] = text_cfg.get("n_routed_experts")
+        info["loop_passes"] = text_cfg.get("loop_config", {}).get("num_passes")
+        info["steering_tensors"] = manifest.get("steering_tensors")
+        info["luts"] = manifest.get("luts")
+        info["separate_lm_head"] = True
     else:
         meta = json.loads((directory / "lamq.json").read_text())
         weights = directory / "model.safetensors"
@@ -135,6 +151,11 @@ def load(
         from . import fast_q35
 
         return fast_q35.load(directory, kind=kind, verify=verify, fuse=fuse)
+
+    if fmt == "inkling2-packed":
+        from .inkling import load_inkling
+
+        return load_inkling(directory)
 
     from . import model as lamq_model
 
@@ -172,19 +193,28 @@ def encode_messages(
     thinking: bool = False,
 ) -> list[int]:
     """Format chat messages with the tokenizer's chat template into token IDs."""
-    try:
+    tpl = getattr(tokenizer, "chat_template", "") or ""
+    if "reasoning_effort" in tpl:
         encoded = tokenizer.apply_chat_template(
             list(messages),
             tokenize=True,
             add_generation_prompt=True,
-            enable_thinking=thinking,
+            reasoning_effort="low" if thinking else "none",
         )
-    except TypeError:
-        encoded = tokenizer.apply_chat_template(
-            list(messages),
-            tokenize=True,
-            add_generation_prompt=True,
-        )
+    else:
+        try:
+            encoded = tokenizer.apply_chat_template(
+                list(messages),
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=thinking,
+            )
+        except TypeError:
+            encoded = tokenizer.apply_chat_template(
+                list(messages),
+                tokenize=True,
+                add_generation_prompt=True,
+            )
     if isinstance(encoded, str):
         encoded = tokenizer.encode(encoded)
     return _unwrap_ids(encoded)
@@ -296,9 +326,27 @@ class Runtime:
             )
             return cls(m, tok, model_path=model_path, format_name=fmt)
 
+        if fmt == "inkling2-packed":
+            from .inkling import DSparkDrafterMLX, load_inkling, resolve_drafter_files
+
+            drafter_path = resolve_path(drafter)
+            m, tok = load_inkling(model_path)
+            w_path, cfg_path = resolve_drafter_files(
+                drafter_path, fallback_config=model_path / "config.json"
+            )
+            draft = DSparkDrafterMLX(w_path, cfg_path)
+            return cls(
+                m,
+                tok,
+                drafter=draft,
+                model_path=model_path,
+                drafter_path=drafter_path,
+                format_name=fmt,
+            )
+
         if fmt != "opgraph-packed-1":
             raise ValueError(
-                f"speculative drafting requires an opgraph-packed-1 model, got {fmt}"
+                f"speculative drafting requires an opgraph-packed-1 or inkling2-packed model, got {fmt}"
             )
         import mlx.core as mx
         from . import block_q35, draft_vocab_q35, drafter_q35, fast_q35
@@ -371,6 +419,71 @@ class Runtime:
             return
 
         eos = _eos_ids(self.tokenizer)
+        if self.format == "inkling2-packed":
+            from .inkling import stream_dspark, stream_serial
+
+            decoder = _IncrementalDecoder(self.tokenizer)
+            stats: dict[str, Any] = {}
+            emitted_total = 0
+            stopped = False
+            t_start = time.perf_counter()
+            if use_drafter and self.drafter is not None and temp == 0.0:
+                gen = stream_dspark(
+                    self.model,
+                    self.drafter,
+                    ids,
+                    max_tokens=max_tokens,
+                    eos_ids=eos,
+                    adaptive=adaptive,
+                    stats_out=stats,
+                )
+            else:
+                gen = stream_serial(
+                    self.model,
+                    ids,
+                    max_tokens=max_tokens,
+                    eos_ids=eos,
+                    temp=temp,
+                    top_p=top_p,
+                    stats_out=stats,
+                )
+            for raw_chunk in gen:
+                kept: list[int] = []
+                for tid in raw_chunk:
+                    tid = int(tid)
+                    if tid in eos:
+                        stopped = True
+                        break
+                    kept.append(tid)
+                emitted_total += len(kept)
+                text = decoder.push(kept)
+                if kept or text:
+                    yield Chunk(
+                        text=text,
+                        token_ids=kept,
+                        prompt_tokens=len(ids),
+                        generation_tokens=emitted_total,
+                    )
+                if stopped:
+                    break
+            tail = decoder.finalize()
+            prompt_s = float(stats.get("prompt_s", 0.0)) + float(stats.get("drafter_prompt_s", 0.0))
+            rounds_s = float(stats.get("rounds_s", 0.0))
+            if rounds_s <= 0.0:
+                rounds_s = max(time.perf_counter() - t_start - prompt_s, 1e-9)
+            yield Chunk(
+                text=tail,
+                token_ids=[],
+                finish_reason="stop" if stopped else "length",
+                prompt_tokens=len(ids),
+                generation_tokens=emitted_total,
+                prompt_tps=len(ids) / prompt_s if prompt_s > 0 else 0.0,
+                generation_tps=stats.get("tokens", emitted_total) / rounds_s if rounds_s > 0 else 0.0,
+                tokens_per_check=stats.get("tokens_per_check"),
+                stats=stats,
+            )
+            return
+
         if use_drafter and self.drafter is not None and temp == 0.0:
             from . import drafter_q35
 
