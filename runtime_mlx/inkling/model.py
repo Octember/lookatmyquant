@@ -8,8 +8,9 @@ Matches Hugging Face PR #51050 `modeling_inkling2_loop.py` line-for-line:
   - Scaled/LogScaled L2Clip on Q/K/relpos, UnweightedRMSNorm on V, relative position bias + per-token sinks
   - Gated attention output (`sigmoid(gate_proj(h)) * attn_out -> linear`)
   - FP32 Sigmoid Top-8 router (`e_score_correction_bias`, `route_scale=8.0`) + SoftcappedSwiGLU (4.0, 25.0)
-  - All 6,144 MoE experts + 144 attention linears + untied embed/lm_head executed directly from
-    exact bit-packed 4-8 KB SRAM half-warp Metal kernels (`kernels.py`) at ~8.85 GB resident RAM.
+  - Full-speed Apple Silicon Metal kernels (`fast_kernels.py`) with L1 multi-tables, unified 1-launch MoE,
+    fused 5-matrix attention stages, single-launch threadgroup RHTs, pre-allocated FP16 KV cache, and
+    fused Flash-Decoding GQA+RelPos+Sinks SDPA.
 """
 from __future__ import annotations
 
@@ -23,6 +24,32 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from .fast_kernels import (
+    FMT_ID,
+    DenseStage,
+    UnifiedMoESide,
+    block_attn_res_fused,
+    block_attn_res_norm_rht_fast,
+    build_fast_luts,
+    compute_moe_sorted_offsets,
+    embed_lookup_gpu,
+    gqa_relpos_sinks_sdpa_fast,
+    kv_dyn_sconv4_norm_fused,
+    kv_sconv4_norm_fused,
+    moe_wsum_sconv4_res_fused,
+    msg_blend_norm_3x_fused,
+    msg_blend_norm_fused,
+    msg_blend_norm_rht_fast,
+    q_rel_clip_fused,
+    qkv_rel_prep_sliding_fused,
+    rht_in_2304_fast,
+    rht_in_3072_gated_fast,
+    rht_out_2304_fast,
+    short_conv4_res_fused,
+    sigmoid_top8_norm_and_plan_fast,
+    sigmoid_top8_norm_fast,
+    swiglu_rht_1152_fast,
+)
 from .kernels import (
     HASH_MULT_U32,
     lm_dense_matmul,
@@ -120,6 +147,22 @@ class Inkling2Config:
     def total_visits(self) -> int:
         return self.num_hidden_layers + (self.loop_passes - 1) * (self.loop_end - self.loop_start)
 
+    @property
+    def use_fast_metal(self) -> bool:
+        return (
+            self.hidden_size == 2304
+            and self.intermediate_size == 1152
+            and self.num_attention_heads == 24
+            and self.num_key_value_heads == 8
+            and self.head_dim == 128
+            and self.n_routed_experts == 128
+            and self.num_experts_per_tok == 8
+            and self.sconv_kernel_size == 4
+            and self.d_rel == 16
+            and self.rel_extent == 1024
+            and self.sliding_window_size == 1024
+        )
+
 
 # ----------------------------------------------------------------------------- Primitives (exact FP32 matching HF)
 
@@ -148,7 +191,6 @@ def l2_clip(x: mx.array, threshold: float) -> mx.array:
 
 
 def log_scale(x: mx.array, position_ids: mx.array, alpha: float, n_floor: int) -> mx.array:
-    # position_ids: [B, T]
     tau = 1.0 + alpha * mx.log(mx.maximum((position_ids.astype(mx.float32) + 1.0) / float(n_floor), 1.0))
     return x.astype(mx.float32) * tau[..., None, None]
 
@@ -172,54 +214,158 @@ def softcapped_swiglu(gate_up: mx.array, gate_cap: float = 4.0, up_cap: float = 
     return _softcapped_swiglu_compiled(gate_up, _f32(gate_cap), _f32(up_cap))
 
 
+@mx.compile
+def _route_top8_compiled(flat: mx.array, router_w: mx.array, router_bias: mx.array, route_scale: mx.array):
+    logits = flat @ router_w.T
+    scores = mx.sigmoid(logits)
+    biased = scores + router_bias[None, :]
+    idx_top = mx.argpartition(-biased, 7, axis=-1)[:, :8]
+    w_raw = mx.take_along_axis(scores, idx_top, axis=-1)
+    w_norm = (w_raw / (mx.sum(w_raw, axis=-1, keepdims=True) + 1e-20)) * route_scale
+    return idx_top.reshape(-1), w_norm.reshape(-1)
+
+
 # ----------------------------------------------------------------------------- 48-Visit KV + Conv Cache
 
 class Inkling2Cache:
-    """KV + 4-slot causal conv state cache across all 48 logical layer visits, with exact speculative rollback."""
+    """KV + 4-slot causal conv state cache across all 48 logical layer visits, with O(1) speculative rollback.
+
+    Uses pre-allocated `float16[n_kv, cap, head_dim]` buffers on the fast Inkling-2-Mini path (zero per-step
+    `mx.concatenate` copies) and falls back cleanly to dynamic `float32` buffers on miniature test configs.
+    """
 
     def __init__(self, cfg: Inkling2Config):
         self.cfg = cfg
         n_slots = cfg.total_visits
+        self._fast = cfg.use_fast_metal
+        # Generic fallback KV
         self.keys: list[mx.array | None] = [None] * n_slots
         self.values: list[mx.array | None] = [None] * n_slots
+        # Fast pre-allocated FP16 KV
+        self.kv_k_f16: list[mx.array | None] = [None] * n_slots
+        self.kv_v_f16: list[mx.array | None] = [None] * n_slots
+        self.kv_len: list[int] = [0] * n_slots
+        self.kv_start: list[int] = [0] * n_slots
+        self.kv_cap: list[int] = [0] * n_slots
+        self.kv_is_sliding: list[bool] = [False] * n_slots
+
         self.conv_states: list[list[mx.array | None]] = [[None, None, None, None] for _ in range(n_slots)]
         self.seq_len: int = 0
         self._spec_recording: bool = False
         self._spec_base_seq: int = 0
+        self._spec_base_kv_len: list[int] = [0] * n_slots
         self._spec_kv_full: list[tuple[mx.array, mx.array, bool] | None] = [None] * n_slots
         self._spec_conv_full: list[list[mx.array | None]] = [[None, None, None, None] for _ in range(n_slots)]
+        self._spec_conv_pair: list[list[tuple[mx.array, mx.array] | None]] = [[None, None, None, None] for _ in range(n_slots)]
 
     def begin_spec_verify(self):
         self._spec_recording = True
         self._spec_base_seq = self.seq_len
+        if self._fast:
+            self._spec_base_kv_len = list(self.kv_len)
 
     def commit_spec_verify(self, k_accept: int, block_len: int):
         """Roll back KV & conv states after verifying `block_len` tokens and accepting the first `k_accept` (`1..block_len`)."""
         self._spec_recording = False
         drop = block_len - k_accept
         self.seq_len = self._spec_base_seq + k_accept
+        W = self.cfg.sliding_window_size
         for slot in range(len(self.keys)):
-            kv = self._spec_kv_full[slot]
-            if kv is not None:
-                K, V, is_sliding = kv
-                if drop > 0:
-                    K = K[:, :, :-drop, :]
-                    V = V[:, :, :-drop, :]
-                if is_sliding and K.shape[2] > self.cfg.sliding_window_size:
-                    K = K[:, :, -self.cfg.sliding_window_size :, :]
-                    V = V[:, :, -self.cfg.sliding_window_size :, :]
-                self.keys[slot] = K
-                self.values[slot] = V
-                self._spec_kv_full[slot] = None
+            if self._fast:
+                new_len = self._spec_base_kv_len[slot] + k_accept
+                self.kv_len[slot] = new_len
+                if self.kv_is_sliding[slot] and new_len > W + 256 and self.kv_k_f16[slot] is not None:
+                    shift = new_len - W
+                    K = self.kv_k_f16[slot]
+                    V = self.kv_v_f16[slot]
+                    K_new = mx.zeros((K.shape[0], self.kv_cap[slot], K.shape[2]), dtype=mx.float16)
+                    V_new = mx.zeros((V.shape[0], self.kv_cap[slot], V.shape[2]), dtype=mx.float16)
+                    K_new[:, :W, :] = K[:, shift:new_len, :]
+                    V_new[:, :W, :] = V[:, shift:new_len, :]
+                    self.kv_k_f16[slot] = K_new
+                    self.kv_v_f16[slot] = V_new
+                    self.kv_start[slot] += shift
+                    self.kv_len[slot] = W
+            else:
+                kv = self._spec_kv_full[slot]
+                if kv is not None:
+                    K, V, is_sliding = kv
+                    if drop > 0:
+                        K = K[:, :, :-drop, :]
+                        V = V[:, :, :-drop, :]
+                    if is_sliding and K.shape[2] > W:
+                        K = K[:, :, -W:, :]
+                        V = V[:, :, -W:, :]
+                    self.keys[slot] = K
+                    self.values[slot] = V
+                    self._spec_kv_full[slot] = None
+
             for ci in range(4):
+                cp = self._spec_conv_pair[slot][ci]
+                if cp is not None:
+                    prev, x_btc = cp
+                    if drop > 0:
+                        if k_accept >= 3:
+                            self.conv_states[slot][ci] = x_btc[:, k_accept - 3 : k_accept, :]
+                        else:
+                            self.conv_states[slot][ci] = mx.concatenate([prev[:, k_accept:, :], x_btc[:, :k_accept, :]], axis=1)
+                    self._spec_conv_pair[slot][ci] = None
                 cf = self._spec_conv_full[slot][ci]
                 if cf is not None:
                     need = cf.shape[1] - block_len
                     self.conv_states[slot][ci] = cf[:, k_accept : k_accept + need, :]
                     self._spec_conv_full[slot][ci] = None
 
+    def get_conv_prev(self, slot: int, conv_idx: int, C: int) -> mx.array:
+        prev = self.conv_states[slot][conv_idx]
+        if prev is None:
+            prev = mx.zeros((1, 3, C), dtype=mx.float32)
+        return prev
+
+    def set_conv_after(self, slot: int, conv_idx: int, prev: mx.array, x_btc: mx.array, new_prev: mx.array):
+        if self._spec_recording:
+            self._spec_conv_pair[slot][conv_idx] = (prev, x_btc)
+        self.conv_states[slot][conv_idx] = new_prev
+
+    def update_kv_f16(self, slot: int, k_f16: mx.array, v_f16: mx.array, is_sliding: bool) -> tuple[mx.array, mx.array, int, int, int]:
+        """Pre-allocated FP16 KV append. k_f16, v_f16: `[8, T, 128]` float16. Returns `(K, V, kv_len, kv_start, kv_cap)`."""
+        T = int(k_f16.shape[1])
+        cur = self.kv_len[slot]
+        self.kv_is_sliding[slot] = is_sliding
+        W = self.cfg.sliding_window_size
+        # Compact sliding buffer only outside spec verify when past W + 256
+        if is_sliding and not self._spec_recording and cur + T > self.kv_cap[slot] and cur > W:
+            shift = cur - W
+            K_old, V_old = self.kv_k_f16[slot], self.kv_v_f16[slot]
+            new_cap = max(self.kv_cap[slot], ((W + T + 255) // 256) * 256)
+            K_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
+            V_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
+            K_new[:, :W, :] = K_old[:, shift:cur, :]
+            V_new[:, :W, :] = V_old[:, shift:cur, :]
+            self.kv_k_f16[slot] = K_new
+            self.kv_v_f16[slot] = V_new
+            self.kv_cap[slot] = new_cap
+            self.kv_start[slot] += shift
+            cur = W
+        need = cur + T
+        if self.kv_k_f16[slot] is None or need > self.kv_cap[slot]:
+            new_cap = ((need + 255) // 256) * 256
+            K_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
+            V_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
+            if self.kv_k_f16[slot] is not None and cur > 0:
+                K_new[:, :cur, :] = self.kv_k_f16[slot][:, :cur, :]
+                V_new[:, :cur, :] = self.kv_v_f16[slot][:, :cur, :]
+            self.kv_k_f16[slot] = K_new
+            self.kv_v_f16[slot] = V_new
+            self.kv_cap[slot] = new_cap
+        K_buf = self.kv_k_f16[slot]
+        V_buf = self.kv_v_f16[slot]
+        K_buf[:, cur:need, :] = k_f16
+        V_buf[:, cur:need, :] = v_f16
+        self.kv_len[slot] = need
+        return K_buf, V_buf, need, self.kv_start[slot], self.kv_cap[slot]
+
     def update_kv(self, slot: int, k: mx.array, v: mx.array, is_sliding: bool) -> tuple[mx.array, mx.array]:
-        # k, v: [B, n_kv, T, head_dim]
         if self.keys[slot] is None:
             K, V = k, v
         else:
@@ -236,7 +382,6 @@ class Inkling2Cache:
         return K, V
 
     def update_conv(self, slot: int, conv_idx: int, x_btc: mx.array, kernel_size: int) -> mx.array:
-        # x_btc: [B, T, C] float32. Returns context [B, T + kernel_size - 1, C] with exact causal left-padding (zero transposes!).
         B, T, C = x_btc.shape
         need = kernel_size - 1
         prev = self.conv_states[slot][conv_idx]
@@ -255,11 +400,18 @@ class Inkling2Cache:
     @property
     def state(self) -> list[mx.array]:
         out: list[mx.array] = []
-        for k, v in zip(self.keys, self.values):
-            if k is not None:
-                out.append(k)
-            if v is not None:
-                out.append(v)
+        if self._fast:
+            for k, v in zip(self.kv_k_f16, self.kv_v_f16):
+                if k is not None:
+                    out.append(k)
+                if v is not None:
+                    out.append(v)
+        else:
+            for k, v in zip(self.keys, self.values):
+                if k is not None:
+                    out.append(k)
+                if v is not None:
+                    out.append(v)
         for slot_c in self.conv_states:
             for c in slot_c:
                 if c is not None:
@@ -313,58 +465,135 @@ class PackedLinear:
 
 
 class PackedMoE:
-    """Executes all 128 MoE experts from 4-8 KB SRAM half-warp packed slabs with shared layer input RHT.
+    """Executes all 128 MoE experts in ONE launch per side (`gu`, `dn`) via `UnifiedMoESide` on Inkling-2-Mini."""
 
-    100% GPU-resident and zero CPU↔GPU syncs: routes all `T` tokens in one batch and dispatches
-    each active format slab once with `0xFFFFFFFF` sentinel masking so the entire 48-visit model
-    runs in one unbroken asynchronous Metal command stream.
-    """
-
-    def __init__(self, arrays: dict[str, Any], luts: dict[str, mx.array], router_w: mx.array, router_bias: mx.array, cfg: Inkling2Config):
+    def __init__(
+        self,
+        arrays: dict[str, Any],
+        luts: dict[str, mx.array],
+        fast_luts: dict[str, mx.array] | None,
+        router_w: mx.array,
+        router_bias: mx.array,
+        cfg: Inkling2Config,
+    ):
         self.cfg = cfg
-        self.router_w = router_w.astype(mx.float32)          # [128, 2304]
-        self.router_bias = router_bias.astype(mx.float32)    # [128]
+        self._fast = cfg.use_fast_metal and fast_luts is not None
+        self.router_w = router_w.astype(mx.float32)
+        self.router_w_f16 = router_w.astype(mx.float16) if self._fast else None
+        self.router_bias = router_bias.astype(mx.float32)
         self.gu_signs_in = mx.array(arrays["gu_signs_in"].astype(np.float32))
         self.dn_signs_in = mx.array(arrays["dn_signs_in"].astype(np.float32))
-        gu_map = np.asarray(arrays["gu_map"], dtype=np.int32)  # [128, 2] -> (fmt_id, local_idx)
+        gu_map = np.asarray(arrays["gu_map"], dtype=np.int32)
         dn_map = np.asarray(arrays["dn_map"], dtype=np.int32)
-        self.gu_map_fid = mx.array(gu_map[:, 0].astype(np.int32))
-        self.gu_map_loc = mx.array(gu_map[:, 1].astype(np.uint32))
-        self.dn_map_fid = mx.array(dn_map[:, 0].astype(np.int32))
-        self.dn_map_loc = mx.array(dn_map[:, 1].astype(np.uint32))
-        self._sentinel = mx.array(0xFFFFFFFF, dtype=mx.uint32)
-        self.gu_slabs: list[tuple[int, mx.array, mx.array, mx.array, tuple[int, int, int, int]]] = []
-        self.dn_slabs: list[tuple[int, mx.array, mx.array, mx.array, tuple[int, int, int, int]]] = []
+        gu_map_fid = mx.array(gu_map[:, 0].astype(np.int32))
+        gu_map_loc = mx.array(gu_map[:, 1].astype(np.uint32))
+        dn_map_fid = mx.array(dn_map[:, 0].astype(np.int32))
+        dn_map_loc = mx.array(dn_map[:, 1].astype(np.uint32))
+
+        gu_slabs = []
+        dn_slabs = []
         for fid, fmt in ID_TO_FMT.items():
             gk = f"gu_{fmt}_codes"
             if gk in arrays:
-                self.gu_slabs.append((fid, mx.array(arrays[gk]), mx.array(arrays[f"gu_{fmt}_scales"]), luts[fmt], FMT_PARAMS[fmt]))
+                gu_slabs.append((fid, mx.array(arrays[gk]), mx.array(arrays[f"gu_{fmt}_scales"]), luts[fmt], FMT_PARAMS[fmt]))
             dk = f"dn_{fmt}_codes"
             if dk in arrays:
-                self.dn_slabs.append((fid, mx.array(arrays[dk]), mx.array(arrays[f"dn_{fmt}_scales"]), luts[fmt], FMT_PARAMS[fmt]))
+                dn_slabs.append((fid, mx.array(arrays[dk]), mx.array(arrays[f"dn_{fmt}_scales"]), luts[fmt], FMT_PARAMS[fmt]))
+
+        if self._fast:
+            self.gu_unified = UnifiedMoESide(gu_slabs, gu_map_fid, gu_map_loc, 2 * cfg.intermediate_size, cfg.hidden_size, fast_luts)
+            self.dn_unified = UnifiedMoESide(dn_slabs, dn_map_fid, dn_map_loc, cfg.hidden_size, cfg.intermediate_size, fast_luts)
+            self.gu_slabs = []
+            self.dn_slabs = []
+        else:
+            self.gu_map_fid, self.gu_map_loc = gu_map_fid, gu_map_loc
+            self.dn_map_fid, self.dn_map_loc = dn_map_fid, dn_map_loc
+            self._sentinel = mx.array(0xFFFFFFFF, dtype=mx.uint32)
+            self.gu_slabs = gu_slabs
+            self.dn_slabs = dn_slabs
+
+    def forward_fast_fused_prerot(
+        self,
+        h_mlp_f16: mx.array,
+        x_rot_gu_f16: mx.array,
+        residual: mx.array,
+        post_mlp_conv_w: mx.array,
+        cache: Inkling2Cache,
+        cache_slot: int,
+        T: int,
+    ) -> mx.array:
+        """Full fast MoE taking pre-rotated `x_rot_gu_f16` + `h_mlp_f16` from fused BAR/MsgBlend+Norm+RHT."""
+        logits_f16 = h_mlp_f16 @ self.router_w_f16.T
+        if 2 <= T <= 8:
+            eids_flat, w_norm, gu_plan, dn_plan = sigmoid_top8_norm_and_plan_fast(
+                logits_f16, self.router_bias, self.cfg.route_scale,
+                self.gu_unified.exp_fid, self.gu_unified.fids,
+                self.dn_unified.exp_fid, self.dn_unified.fids,
+            )
+            sc = None
+        else:
+            eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
+            gu_plan = dn_plan = None
+            sc = compute_moe_sorted_offsets(eids_flat) if T > 8 else None
+        y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan)
+        act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+        y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan)
+
+        prev = cache.get_conv_prev(cache_slot, 3, 2304)
+        if T <= 16:
+            out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T)
+            cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
+            return out
+        mlp_sum = mx.sum(y_dn.reshape(T, 8, 2304) * w_norm.reshape(T, 8, 1), axis=1)
+        out, new_prev = short_conv4_res_fused(prev, mlp_sum, post_mlp_conv_w, T, 2304, residual=residual)
+        cache.set_conv_after(cache_slot, 3, prev, mlp_sum.reshape(1, T, 2304), new_prev)
+        return out
+
+    def forward_fast_fused(
+        self,
+        h_mlp: mx.array,
+        residual: mx.array,
+        post_mlp_conv_w: mx.array,
+        cache: Inkling2Cache,
+        cache_slot: int,
+        T: int,
+    ) -> mx.array:
+        """Full fast MoE + fused weighted-sum + post-MLP short_conv + residual add."""
+        flat = h_mlp.reshape(T, 2304)
+        x_rot = rht_in_2304_fast(flat, self.gu_signs_in, n_signs=1, T=T, out_dtype=mx.float16)
+        return self.forward_fast_fused_prerot(flat.astype(mx.float16), x_rot, residual, post_mlp_conv_w, cache, cache_slot, T)
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        # hidden_states: [B, T, 2304]
         B, T, H = hidden_states.shape
         N = B * T
         K_top = self.cfg.num_experts_per_tok
         flat = hidden_states.reshape(N, H).astype(mx.float32)
 
-        logits = flat @ self.router_w.T  # [N, 128]
+        if self._fast:
+            logits_f16 = flat.astype(mx.float16) @ self.router_w_f16.T
+            eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
+            x_rot = rht_in_2304_fast(flat, self.gu_signs_in, n_signs=1, T=N, out_dtype=mx.float16)
+            sc = compute_moe_sorted_offsets(eids_flat) if N > 8 else None
+            y_gu = self.gu_unified(x_rot, eids_flat, x_div=8, sorted_cache=sc)
+            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc)
+            out = mx.sum(y_dn.reshape(N, 8, 2304) * w_norm.reshape(N, 8, 1), axis=1)
+            return out.reshape(B, T, H)
+
+        logits = flat @ self.router_w.T
         scores = mx.sigmoid(logits)
         biased = scores + self.router_bias[None, :]
-        idx_top = mx.argpartition(-biased, K_top - 1, axis=-1)[:, :K_top]  # [N, 8]
-        w_raw = mx.take_along_axis(scores, idx_top, axis=-1)               # [N, 8]
+        idx_top = mx.argpartition(-biased, K_top - 1, axis=-1)[:, :K_top]
+        w_raw = mx.take_along_axis(scores, idx_top, axis=-1)
         w_norm = (w_raw / (mx.sum(w_raw, axis=-1, keepdims=True) + 1e-20)) * self.cfg.route_scale
 
-        eids_flat = idx_top.reshape(-1)  # [N * 8]
+        eids_flat = idx_top.reshape(-1)
         gu_fids = self.gu_map_fid[eids_flat]
         gu_locs = self.gu_map_loc[eids_flat]
         dn_fids = self.dn_map_fid[eids_flat]
         dn_locs = self.dn_map_loc[eids_flat]
 
-        # Shared input RHT computed ONCE for all N tokens; x_div=K_top maps slot s -> x_rot[s // K_top]
-        x_rot = rht_apply_in(flat, self.gu_signs_in)  # [N, H]
+        x_rot = rht_apply_in(flat, self.gu_signs_in)
         use_grouped = 2 <= N <= 8
         moe_fn = trellis_moe_grouped if use_grouped else trellis_matvec
         single_gu = len(self.gu_slabs) == 1
@@ -377,8 +606,8 @@ class PackedMoE:
             )
             y_gu_total = y_f if y_gu_total is None else (y_gu_total + y_f)
 
-        act = softcapped_swiglu(y_gu_total, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap)  # [N * 8, 1152]
-        act_rot = rht_apply_in(act, self.dn_signs_in)  # [N * 8, 1152]
+        act = softcapped_swiglu(y_gu_total, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap)
+        act_rot = rht_apply_in(act, self.dn_signs_in)
 
         single_dn = len(self.dn_slabs) == 1
         y_dn_total = None
@@ -397,34 +626,84 @@ class PackedMoE:
 # ----------------------------------------------------------------------------- Packed Embed & LM Head
 
 class PackedEmbed:
-    """Decodes individual token rows on the fly from `embed_packed.npz` (~150 MB RAM)."""
+    """100% GPU-resident packed token embedding lookup (zero CPU sync on H=2304; NumPy fallback for mini tests)."""
 
     def __init__(self, packed_dir: Path, luts: dict[str, mx.array], embed_norm_w: mx.array, eps: float):
         self.meta = json.loads((packed_dir / "embed_meta.json").read_text())
         npz = np.load(packed_dir / "embed_packed.npz")
-        order = npz["order"]
-        self.inv_order = np.empty_like(order)
-        self.inv_order[order] = np.arange(len(order), dtype=np.int32)
+        order = np.array(npz["order"], dtype=np.int32)
+        inv = np.empty_like(order)
+        inv[order] = np.arange(len(order), dtype=np.int32)
         self.embed_norm_w = embed_norm_w.astype(mx.float32)
         self.hidden_size = int(self.embed_norm_w.shape[0])
         self.eps = eps
-        self.luts_np = {k: np.array(v, dtype=np.float32) for k, v in luts.items()}
-        self.buckets: list[dict[str, Any]] = []
-        lo = 0
-        for bm in self.meta:
-            kb = bm["kb"]
-            rows = bm["rows"]
-            opt = bm["opt"]
-            binfo: dict[str, Any] = {"lo": lo, "hi": lo + rows, "opt": opt, "k": bm["k"]}
-            binfo["codes"] = np.array(npz[f"b{kb}_codes"])
-            binfo["scales"] = np.array(npz[f"b{kb}_scales"], dtype=np.float32)
-            binfo["signs_in"] = mx.array(np.array(npz[f"b{kb}_signs_in"], dtype=np.float32))
-            if opt.startswith("lm"):
-                binfo["levels"] = np.array(npz[f"b{kb}_levels"], dtype=np.float32)
-            else:
-                binfo["lut"] = self.luts_np[opt]
-            self.buckets.append(binfo)
-            lo += rows
+        self._fast = self.hidden_size == 2304
+
+        if self._fast:
+            self.inv_order_mx = mx.array(inv.astype(np.uint32))
+            codes_parts, scales_parts, levels_parts, signs_parts = [], [], [], []
+            b_hi, b_dims = [], []
+            c_off = s_off = l_off = hi = 0
+            for bm in self.meta:
+                kb = bm["kb"]
+                rows = int(bm["rows"])
+                opt = bm["opt"]
+                k = int(bm["k"])
+                fid = FMT_ID[opt]
+                if opt in ("lm6", "lm8"):
+                    raw_u8 = np.ascontiguousarray(np.array(npz[f"b{kb}_codes"], dtype=np.uint8)).reshape(rows, -1)
+                    c_u32 = raw_u8.view(np.uint32)
+                    lv = np.array(npz[f"b{kb}_levels"], dtype=np.float16).reshape(-1)
+                else:
+                    c_u32 = np.ascontiguousarray(np.array(npz[f"b{kb}_codes"], dtype=np.uint32)).reshape(rows, -1)
+                    lv = np.zeros(0, dtype=np.float16)
+                wpr = int(c_u32.shape[1])
+                hi += rows
+                b_hi.append(hi)
+                b_dims.append([fid, k, wpr, c_off, s_off, l_off])
+                codes_parts.append(c_u32.reshape(-1))
+                scales_parts.append(np.array(npz[f"b{kb}_scales"], dtype=np.float16).reshape(-1))
+                if len(lv):
+                    levels_parts.append(lv)
+                signs_parts.append(np.array(npz[f"b{kb}_signs_in"], dtype=np.float32).reshape(1, 2304))
+                c_off += c_u32.size
+                s_off += rows
+                l_off += len(lv)
+            codes_parts.append(np.zeros(4, dtype=np.uint32))
+            if not levels_parts:
+                levels_parts.append(np.zeros(4, dtype=np.float16))
+            self.gpu_codes = mx.array(np.concatenate(codes_parts))
+            self.gpu_scales = mx.array(np.concatenate(scales_parts))
+            self.gpu_levels = mx.array(np.concatenate(levels_parts))
+            self.gpu_signs_all = mx.array(np.concatenate(signs_parts, axis=0))
+            self.gpu_b_hi = mx.array(np.array(b_hi, dtype=np.uint32))
+            self.gpu_b_dims = mx.array(np.array(b_dims, dtype=np.uint32).reshape(-1))
+            rtr_stack = [
+                (luts[name].reshape(4096).astype(mx.float16) if name in luts else mx.zeros((4096,), dtype=mx.float16))
+                for name in ("rtr1", "rtr2", "rtr3", "rtr4")
+            ]
+            self.gpu_rtr_luts = mx.concatenate(rtr_stack, axis=0)
+            self.nb = len(self.meta)
+            mx.eval(self.inv_order_mx, self.gpu_codes, self.gpu_scales, self.gpu_levels, self.gpu_signs_all, self.gpu_b_hi, self.gpu_b_dims, self.gpu_rtr_luts)
+        else:
+            self.inv_order = inv
+            self.luts_np = {k: np.array(v, dtype=np.float32) for k, v in luts.items()}
+            self.buckets: list[dict[str, Any]] = []
+            lo = 0
+            for bm in self.meta:
+                kb = bm["kb"]
+                rows = bm["rows"]
+                opt = bm["opt"]
+                binfo: dict[str, Any] = {"lo": lo, "hi": lo + rows, "opt": opt, "k": bm["k"]}
+                binfo["codes"] = np.array(npz[f"b{kb}_codes"])
+                binfo["scales"] = np.array(npz[f"b{kb}_scales"], dtype=np.float32)
+                binfo["signs_in"] = mx.array(np.array(npz[f"b{kb}_signs_in"], dtype=np.float32))
+                if opt.startswith("lm"):
+                    binfo["levels"] = np.array(npz[f"b{kb}_levels"], dtype=np.float32)
+                else:
+                    binfo["lut"] = self.luts_np[opt]
+                self.buckets.append(binfo)
+                lo += rows
 
     def _decode_row(self, pos: int) -> mx.array:
         n = self.hidden_size
@@ -436,14 +715,13 @@ class PackedEmbed:
                 if b["opt"].startswith("lm"):
                     if k == 8:
                         idx = b["codes"].reshape(-1, n)[r]
-                    else:  # k == 6
+                    else:
                         bpr = (n * 6) // 8
                         raw = b["codes"][r * bpr : (r + 1) * bpr].reshape(-1, 3).astype(np.uint32)
                         v = raw[:, 0] | (raw[:, 1] << 8) | (raw[:, 2] << 16)
                         idx = np.stack([v & 63, (v >> 6) & 63, (v >> 12) & 63, (v >> 18) & 63], axis=-1).reshape(-1)
                     q = b["levels"][idx] * scale
                 else:
-                    # RowTrellisCode (g=1, L=12) — vectorized numpy unpack
                     wpr = (n * k) // 32
                     row_u32 = b["codes"][r].astype(np.uint64)
                     bp = (n - 1 - np.arange(n, dtype=np.int64)) * k
@@ -458,63 +736,160 @@ class PackedEmbed:
                 return rht_apply_out(mx.array(q[None, :]), b["signs_in"])[0]
         raise IndexError(f"Token position {pos} out of range")
 
-    def __call__(self, input_ids: list[int] | np.ndarray) -> mx.array:
+    def __call__(self, input_ids: list[int] | np.ndarray | mx.array) -> mx.array:
+        if self._fast:
+            ids_mx = input_ids if isinstance(input_ids, mx.array) else mx.array(np.asarray(input_ids, dtype=np.int32))
+            q_out, b_idx = embed_lookup_gpu(
+                ids_mx, self.inv_order_mx, self.gpu_b_hi, self.gpu_b_dims,
+                self.gpu_codes, self.gpu_scales, self.gpu_levels, self.gpu_rtr_luts, self.nb,
+            )
+            h = rht_out_2304_fast(q_out, self.gpu_signs_all, b_idx)[None, :, :]
+            return rms_norm(h, self.embed_norm_w, self.eps)
         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
         rows = [self._decode_row(int(self.inv_order[int(t)])) for t in ids]
-        h = mx.stack(rows, axis=0)[None, :, :]  # [1, T, 2304]
+        h = mx.stack(rows, axis=0)[None, :, :]
         return rms_norm(h, self.embed_norm_w, self.eps)
 
 
 class PackedLMHead:
-    """Executes unpadded `[200058, 2304]` lm_head directly from `head_packed.npz` (~176 MB RAM)."""
+    """Executes unpadded `[200058, 2304]` lm_head in ONE fused DenseStage launch + lazy 32K MLX4 draft shortlist."""
 
-    def __init__(self, packed_dir: Path, luts: dict[str, mx.array], cap: float):
+    def __init__(self, packed_dir: Path, luts: dict[str, mx.array], fast_luts: dict[str, mx.array] | None, cap: float, hidden_size: int):
         self.meta = json.loads((packed_dir / "head_meta.json").read_text())
         self.cap = cap
+        self.hidden_size = int(hidden_size)
+        self._fast = self.hidden_size == 2304 and fast_luts is not None
         npz = np.load(packed_dir / "head_packed.npz")
         order = np.array(npz["order"], dtype=np.int32)
         inv = np.empty_like(order)
         inv[order] = np.arange(len(order), dtype=np.int32)
+        self.order_np = order
+        self.order_mx = mx.array(order)
         self.inv_order = mx.array(inv)
-        self.buckets: list[dict[str, Any]] = []
-        for bm in self.meta:
-            kb = bm["kb"]
-            opt = bm["opt"]
-            b: dict[str, Any] = {
-                "opt": opt,
-                "rows": int(bm["rows"]),
-                "k": int(bm["k"]),
-                "codes": mx.array(npz[f"b{kb}_codes"]),
-                "scales": mx.array(npz[f"b{kb}_scales"]),
-                "signs_in": mx.array(npz[f"b{kb}_signs_in"].astype(np.float32)),
-            }
-            if opt.startswith("lm"):
-                b["levels"] = mx.array(npz[f"b{kb}_levels"].astype(np.float32))
-            else:
-                b["g"] = int(bm["g"])
-                b["K"] = int(bm["K"])
-                b["hash_mult"] = int(bm["hash_mult"])
-                b["lut"] = luts[opt]
-            self.buckets.append(b)
+        self._draft_cache: dict[tuple[int, int], tuple[mx.array, mx.array, mx.array, mx.array, int]] = {}
 
-    def __call__(self, h: mx.array) -> mx.array:
-        # h: [B, T, 2304]
-        B, T, H = h.shape
-        x2 = h.reshape(B * T, H)
+        if self._fast:
+            items = []
+            for bm in self.meta:
+                kb = bm["kb"]
+                opt = bm["opt"]
+                it: dict[str, Any] = {
+                    "fmt": opt,
+                    "m": int(bm["rows"]),
+                    "codes": npz[f"b{kb}_codes"],
+                    "scales": npz[f"b{kb}_scales"],
+                    "signs_in": npz[f"b{kb}_signs_in"].astype(np.float32),
+                }
+                if opt.startswith("lm"):
+                    it["levels"] = npz[f"b{kb}_levels"].astype(np.float32)
+                items.append(it)
+            self.stage = DenseStage(items, 2304, fast_luts)
+            self.nb = len(items)
+            self._fast_luts = fast_luts
+            self._packed_dir = packed_dir
+            self.buckets = []
+        else:
+            self.stage = None
+            self.buckets: list[dict[str, Any]] = []
+            for bm in self.meta:
+                kb = bm["kb"]
+                opt = bm["opt"]
+                b: dict[str, Any] = {
+                    "opt": opt,
+                    "rows": int(bm["rows"]),
+                    "k": int(bm["k"]),
+                    "codes": mx.array(npz[f"b{kb}_codes"]),
+                    "scales": mx.array(npz[f"b{kb}_scales"]),
+                    "signs_in": mx.array(npz[f"b{kb}_signs_in"].astype(np.float32)),
+                }
+                if opt.startswith("lm"):
+                    b["levels"] = mx.array(npz[f"b{kb}_levels"].astype(np.float32))
+                else:
+                    b["g"] = int(bm["g"])
+                    b["K"] = int(bm["K"])
+                    b["hash_mult"] = int(bm["hash_mult"])
+                    b["lut"] = luts[opt]
+                self.buckets.append(b)
+
+    def _ordered_logits(self, x2: mx.array) -> mx.array:
+        T = int(x2.shape[0])
+        if self._fast:
+            if 2 <= T <= 8:
+                x_rot_tr = rht_in_2304_fast(x2, self.stage.signs_in, n_signs=self.nb, T=T, out_dtype=mx.float16, transpose_for_sg8=True)
+                return self.stage.matmul_rotated_sg8_f16(x_rot_tr, T=T)
+            x_rot = rht_in_2304_fast(x2, self.stage.signs_in, n_signs=self.nb, T=T, out_dtype=mx.float16)
+            return self.stage.matmul_rotated_f16(x_rot, T)
         parts = []
         for b in self.buckets:
             x_rot = rht_apply_in(x2, b["signs_in"])
             if b["opt"].startswith("lm"):
-                y = lm_dense_matmul(x_rot, b["codes"], b["scales"], b["levels"], b["rows"], H, b["k"])
+                y = lm_dense_matmul(x_rot, b["codes"], b["scales"], b["levels"], b["rows"], self.hidden_size, b["k"])
             else:
                 y = trellis_dense_matmul(
                     x_rot, b["codes"], b["scales"], b["lut"],
-                    b["rows"], H, b["k"], b["g"], b["K"], b["hash_mult"],
+                    b["rows"], self.hidden_size, b["k"], b["g"], b["K"], b["hash_mult"],
                 )
             parts.append(y)
-        ordered = mx.concatenate(parts, axis=-1)  # [B*T, 200058]
+        return mx.concatenate(parts, axis=-1)
+
+    def __call__(self, h: mx.array) -> mx.array:
+        B, T, H = h.shape
+        ordered = self._ordered_logits(h.reshape(B * T, H))
         logits = ordered[:, self.inv_order]
         return softcap(logits, self.cap).reshape(B, T, -1)
+
+    def argmax(self, h: mx.array) -> mx.array:
+        """Exact greedy argmax skipping `inv_order` permutation and monotonic `softcap`. Returns `int32[B, T]`."""
+        B, T, H = h.shape
+        ordered = self._ordered_logits(h.reshape(B * T, H))
+        best_ord = mx.argmax(ordered, axis=-1)
+        return self.order_mx[best_ord].reshape(B, T)
+
+    def get_draft_head_argmax(self, max_buckets: int = 5, bits: int = 4):
+        """Lazily build a compact MLX 4-bit shortlist head over the top Fisher/frequency buckets (`b0..4` = 32,768 rows, ~38 MB).
+
+        Only used by DSpark's 7-step drafter RNN; the target always verifies against the full 200,058-row packed head.
+        """
+        if not self._fast:
+            return lambda h_1d: self.argmax(h_1d[None, None, :])[0, 0]
+        key = (max_buckets, bits)
+        if key not in self._draft_cache:
+            nb = min(max_buckets, self.nb)
+            # Dequantize ONLY the first `nb` buckets (<= 65,536 rows) on GPU, unrotate each bucket into standard basis, quantize to MLX 4-bit!
+            W_full = self.stage.dequant_f16()
+            wqs, scs, bis = [], [], []
+            total_rows = 0
+            for bi in range(nb):
+                lo, hi = self.stage.slices[bi]
+                rows_b = hi - lo
+                total_rows += rows_b
+                Q_b = W_full[lo:hi].astype(mx.float32)  # [rows_b, 2304]
+                # Unrotate: y = (x @ R_b.T) @ Q_b.T = x @ (Q_b @ R_b).T -> W_b = rht_out_2304_fast(Q_b, signs_b)!
+                W_b = rht_out_2304_fast(Q_b, self.stage.signs_in[bi : bi + 1], mx.zeros((rows_b,), dtype=mx.uint32))
+                wq, sc, bi_q = mx.quantize(W_b.astype(mx.float16), group_size=64, bits=bits)
+                mx.eval(wq, sc, bi_q)
+                wqs.append(wq)
+                scs.append(sc)
+                bis.append(bi_q)
+            del W_full
+            wq_all = mx.concatenate(wqs, axis=0)
+            sc_all = mx.concatenate(scs, axis=0)
+            bi_all = mx.concatenate(bis, axis=0)
+            order_sub = self.order_mx[:total_rows]
+            mx.eval(wq_all, sc_all, bi_all, order_sub)
+            mx.clear_cache()
+            self._draft_cache[key] = (wq_all, sc_all, bi_all, order_sub, bits)
+
+        wq_all, sc_all, bi_all, order_sub, qbits = self._draft_cache[key]
+
+        def _draft_argmax(h_1d: mx.array) -> mx.array:
+            scores = mx.quantized_matmul(
+                h_1d.reshape(1, 2304).astype(mx.float16), wq_all, sc_all, bi_all,
+                transpose=True, group_size=64, bits=qbits,
+            )[0]
+            return order_sub[mx.argmax(scores)]
+
+        return _draft_argmax
 
 
 # ----------------------------------------------------------------------------- Decoder Layer & Full Looped Model
@@ -528,11 +903,10 @@ def _block_attn_res_compiled(q: mx.array, stacked: mx.array, inv_sqrt_h: mx.arra
 
 
 def block_attn_res(query: mx.array, block_states: list[mx.array], partial: mx.array) -> tuple[mx.array, ...]:
-    # block_states: list of [B, T, H], partial: [B, T, H], query: [H] or [num_q, H]
-    stacked = mx.stack(block_states + [partial.astype(mx.float32)], axis=-2)  # [B, T, S, H]
+    stacked = mx.stack(block_states + [partial.astype(mx.float32)], axis=-2)
     H = stacked.shape[-1]
-    q = query.astype(mx.float32).reshape(-1, H)  # [num_q, H]
-    out = _block_attn_res_compiled(q, stacked, _f32(H ** -0.5))  # [B, T, num_q, H]
+    q = query.astype(mx.float32).reshape(-1, H)
+    out = _block_attn_res_compiled(q, stacked, _f32(H ** -0.5))
     return tuple(out[:, :, i, :] for i in range(q.shape[0]))
 
 
@@ -551,13 +925,11 @@ def message_gate(h: mx.array, msg: mx.array, down_w: mx.array, forget_w: mx.arra
 
 @mx.compile
 def _short_conv4_t1(ctx: mx.array, res: mx.array, w_kc: mx.array, inv_s: mx.array) -> mx.array:
-    # ctx: [B, 4, C], w_kc: [4, C] -> [B, 1, C]
     return (mx.sum(ctx * w_kc[None, :, :], axis=1, keepdims=True) + res) * inv_s
 
 
 @mx.compile
 def _short_conv4_tn(ctx: mx.array, res: mx.array, w_kc: mx.array, inv_s: mx.array) -> mx.array:
-    # ctx: [B, T + 3, C], res: [B, T, C], w_kc: [4, C]
     T = res.shape[1]
     out = (
         ctx[:, 0:T, :] * w_kc[None, 0:1, :]
@@ -569,10 +941,9 @@ def _short_conv4_tn(ctx: mx.array, res: mx.array, w_kc: mx.array, inv_s: mx.arra
 
 
 def short_conv(x: mx.array, w_kc: mx.array, cache: Inkling2Cache, slot: int, conv_idx: int) -> mx.array:
-    # x: [B, T, C], w_kc: [K, C] (w_kc[0] oldest tap, w_kc[K-1] current tap!)
     K = w_kc.shape[0]
     xf = x.astype(mx.float32)
-    ctx = cache.update_conv(slot, conv_idx, xf, K)  # [B, T + K - 1, C]
+    ctx = cache.update_conv(slot, conv_idx, xf, K)
     inv_s = _f32(1.0 / math.sqrt(K + 1))
     if K == 4:
         return _short_conv4_t1(ctx, xf, w_kc, inv_s) if xf.shape[1] == 1 else _short_conv4_tn(ctx, xf, w_kc, inv_s)
@@ -585,12 +956,11 @@ def short_conv(x: mx.array, w_kc: mx.array, cache: Inkling2Cache, slot: int, con
 
 @mx.compile
 def _dyn_conv4_compiled(ctx: mx.array, res: mx.array, dyn_in: mx.array, st_hk: mx.array, proj_w: mx.array, inv_s: mx.array) -> mx.array:
-    # ctx: [B, T+3, C], res: [B, T, C], st_hk: [1, 1, num_heads, head_dim, 4]
     B, T, C = res.shape
     num_heads = st_hk.shape[2]
     head_dim = st_hk.shape[3]
     dyn = (dyn_in.astype(mx.float32) @ proj_w.T).reshape(B, T, num_heads, 1, 4)
-    w = st_hk + dyn  # [B, T, num_heads, head_dim, 4]
+    w = st_hk + dyn
     c0 = ctx[:, 3 : T + 3, :].reshape(B, T, num_heads, head_dim)
     c1 = ctx[:, 2 : T + 2, :].reshape(B, T, num_heads, head_dim)
     c2 = ctx[:, 1 : T + 1, :].reshape(B, T, num_heads, head_dim)
@@ -609,12 +979,11 @@ def dynamic_short_conv(
     slot: int,
     conv_idx: int,
 ) -> mx.array:
-    # static_w: [K, C] where static_w[0] weights current token (lag=0), static_w[lag] weights `lag` steps back!
     B, T, C = x.shape
     K = static_w.shape[0]
     head_dim = C // num_heads
     xf = x.astype(mx.float32)
-    ctx = cache.update_conv(slot, conv_idx, xf, K)  # [B, T + K - 1, C]
+    ctx = cache.update_conv(slot, conv_idx, xf, K)
     inv_s = _f32(1.0 / math.sqrt(2 * K + 1))
     st = static_w.T.reshape(1, 1, num_heads, head_dim, K)
     if K == 4:
@@ -638,7 +1007,6 @@ def _gqa_sdpa_sinks_compiled(
     sinks: mx.array,
     inv_sqrt_d: mx.array,
 ) -> mx.array:
-    # Zero-copy GQA without mx.repeat: q [B, n_kv, n_rep, T, D], k/v [B, n_kv, 1, kv_len, D]
     scores = mx.matmul(q, k.transpose(0, 1, 2, 4, 3)) * inv_sqrt_d + pos_bias
     scores = mx.where(allowed, scores, -1e9)
     combined = mx.concatenate([scores, sinks], axis=-1)
@@ -669,10 +1037,42 @@ def _gqa_sdpa_sinks(
     return out.reshape(B, n_kv * n_rep, T, D).transpose(0, 2, 1, 3).reshape(B, T, n_kv * n_rep * D)
 
 
+@mx.compile
+def _msg_3x_shared_h_compiled(h: mx.array, msgs3: mx.array, dh3: mx.array, dm3: mx.array, fm3: mx.array) -> mx.array:
+    hn = mx.fast.rms_norm(h, None, 1e-6).astype(mx.bfloat16)
+    mn = mx.fast.rms_norm(msgs3, None, 1e-6).astype(mx.bfloat16)
+    g = mx.matmul(hn[None, :, :], dh3.swapaxes(-1, -2)) + mx.matmul(mn, dm3.swapaxes(-1, -2))
+    return mx.matmul(g, fm3.swapaxes(-1, -2))
+
+
+@mx.compile
+def _msg_3x_split_h_compiled(h3: mx.array, msgs3: mx.array, dh3: mx.array, dm3: mx.array, fm3: mx.array) -> mx.array:
+    hn = mx.fast.rms_norm(h3, None, 1e-6).astype(mx.bfloat16)
+    mn = mx.fast.rms_norm(msgs3, None, 1e-6).astype(mx.bfloat16)
+    g = mx.matmul(hn, dh3.swapaxes(-1, -2)) + mx.matmul(mn, dm3.swapaxes(-1, -2))
+    return mx.matmul(g, fm3.swapaxes(-1, -2))
+
+
+@mx.compile
+def _msg_1x_compiled(h: mx.array, msg: mx.array, dh: mx.array, dm: mx.array, fm: mx.array) -> mx.array:
+    hn = mx.fast.rms_norm(h, None, 1e-6).astype(mx.bfloat16)
+    mn = mx.fast.rms_norm(msg, None, 1e-6).astype(mx.bfloat16)
+    return (hn @ dh.T + mn @ dm.T) @ fm.T
+
+
 class PackedDecoderLayer:
-    def __init__(self, layer_idx: int, cfg: Inkling2Config, packed_dir: Path, luts: dict[str, mx.array], st: dict[str, mx.array]):
+    def __init__(
+        self,
+        layer_idx: int,
+        cfg: Inkling2Config,
+        packed_dir: Path,
+        luts: dict[str, mx.array],
+        fast_luts: dict[str, mx.array] | None,
+        st: dict[str, mx.array],
+    ):
         self.layer_idx = layer_idx
         self.cfg = cfg
+        self._fast = cfg.use_fast_metal and fast_luts is not None
         self.is_sliding = layer_idx in cfg.local_layer_ids
         self.is_loop = cfg.loop_start <= layer_idx < cfg.loop_end
         self.is_block_boundary = (layer_idx % cfg.n_layers_per_attn_res_block) == 0
@@ -682,16 +1082,47 @@ class PackedDecoderLayer:
         npz = np.load(packed_dir / f"layer_{layer_idx:02d}_packed.npz")
         arrays = {k: npz[k] for k in npz.files}
 
-        # Packed attention linears
         lin_meta = meta["linears"]
-        self.q_lin = PackedLinear(lin_meta["self_attn.q_proj.linear"], arrays, luts)
-        self.k_lin = PackedLinear(lin_meta["self_attn.k_proj.linear"], arrays, luts)
-        self.v_lin = PackedLinear(lin_meta["self_attn.v_proj.linear"], arrays, luts)
-        self.o_lin = PackedLinear(lin_meta["self_attn.o_proj.linear"], arrays, luts)
-        self.o_gate = PackedLinear(lin_meta["self_attn.o_proj.gate_proj"], arrays, luts)
-        self.rel_lin = PackedLinear(lin_meta["self_attn.relative_position_bias.linear"], arrays, luts)
+        if self._fast:
+            def _lin_item(key_name: str) -> dict[str, Any]:
+                lm = lin_meta[key_name]
+                safe = lm["safe"]
+                it: dict[str, Any] = {
+                    "fmt": lm["fmt"],
+                    "m": int(lm["m"]),
+                    "codes": arrays[f"lin_{safe}_codes"],
+                    "scales": arrays[f"lin_{safe}_scales"],
+                    "signs_in": arrays[f"lin_{safe}_signs_in"].astype(np.float32),
+                    "out_rot": bool(lm.get("out_rot", False)),
+                }
+                if it["out_rot"]:
+                    it["signs_out"] = mx.array(arrays[f"lin_{safe}_signs_out"].astype(np.float32))
+                if lm["fmt"].startswith("lm"):
+                    it["levels"] = arrays[f"lin_{safe}_levels"].astype(np.float32)
+                return it
 
-        # Native steering weights (pre-cast to FP32 once at load to eliminate ~960 cast kernels/token)
+            qkv_items = [
+                _lin_item("self_attn.q_proj.linear"),
+                _lin_item("self_attn.k_proj.linear"),
+                _lin_item("self_attn.v_proj.linear"),
+                _lin_item("self_attn.relative_position_bias.linear"),
+                _lin_item("self_attn.o_proj.gate_proj"),
+            ]
+            self.qkv_stage = DenseStage(qkv_items, 2304, fast_luts)
+            self.qkv_out_rots = [it.get("signs_out") if it["out_rot"] else None for it in qkv_items]
+            self.has_qkv_out_rot = any(r is not None for r in self.qkv_out_rots[:4])
+            o_item = _lin_item("self_attn.o_proj.linear")
+            self.o_stage = DenseStage([o_item], 3072, fast_luts)
+            self.o_out_rot = o_item.get("signs_out") if o_item["out_rot"] else None
+        else:
+            self.q_lin = PackedLinear(lin_meta["self_attn.q_proj.linear"], arrays, luts)
+            self.k_lin = PackedLinear(lin_meta["self_attn.k_proj.linear"], arrays, luts)
+            self.v_lin = PackedLinear(lin_meta["self_attn.v_proj.linear"], arrays, luts)
+            self.o_lin = PackedLinear(lin_meta["self_attn.o_proj.linear"], arrays, luts)
+            self.o_gate = PackedLinear(lin_meta["self_attn.o_proj.gate_proj"], arrays, luts)
+            self.rel_lin = PackedLinear(lin_meta["self_attn.relative_position_bias.linear"], arrays, luts)
+
+        # Native steering weights
         self.attn_in_q = st[p + "attention_input.query"].astype(mx.float32) if (p + "attention_input.query") in st else None
         self.mlp_in_q = st[p + "mlp_input.query"].astype(mx.float32)
         if self.is_sliding:
@@ -700,12 +1131,15 @@ class PackedDecoderLayer:
             self.q_in_ln = st[p + "q_input_layernorm.weight"].astype(mx.float32)
             self.k_in_ln = st[p + "k_input_layernorm.weight"].astype(mx.float32)
             self.v_in_ln = st[p + "v_input_layernorm.weight"].astype(mx.float32)
+            self.qkv_in_ln = mx.stack([self.q_in_ln, self.k_in_ln, self.v_in_ln], axis=0) if self._fast else None
         self.post_attn_ln = st[p + "post_attention_layernorm.weight"].astype(mx.float32)
 
         self.q_scale = st[p + "self_attn.q_proj.norm.scale"].astype(mx.float32)
         self.rel_scale = st[p + "self_attn.relative_position_bias.norm.scale"].astype(mx.float32)
         self.rel_proj = st[p + "self_attn.relative_position_bias.proj"].astype(mx.float32)
+        self.rel_proj_t_f16 = self.rel_proj.T.astype(mx.float16) if self._fast else None
         self.sink_w = st[p + "self_attn.sink_proj.weight"].astype(mx.float32)
+        self.sink_w_f16 = self.sink_w.astype(mx.float16) if self._fast else None
 
         if self.is_sliding:
             self.k_conv_w = st[p + "self_attn.k_proj.sconv.conv1d.weight"][:, 0, :].T.astype(mx.float32)
@@ -715,26 +1149,171 @@ class PackedDecoderLayer:
             self.k_dyn_pr = st[p + "self_attn.k_proj.sconv.weight_proj.weight"].astype(mx.float32)
             self.v_dyn_st = st[p + "self_attn.v_proj.sconv.static_weight"].astype(mx.float32)
             self.v_dyn_pr = st[p + "self_attn.v_proj.sconv.weight_proj.weight"].astype(mx.float32)
+            if self._fast:
+                self.k_dyn_pr_f16 = self.k_dyn_pr.astype(mx.float16)
+                self.v_dyn_pr_f16 = self.v_dyn_pr.astype(mx.float16)
 
         self.post_attn_conv_w = st[p + "post_attention_convolution.conv1d.weight"][:, 0, :].T.astype(mx.float32)
         self.post_mlp_conv_w = st[p + "post_mlp_convolution.conv1d.weight"][:, 0, :].T.astype(mx.float32)
 
         if self.is_loop:
             self.msg_gates = {}
+            H = cfg.hidden_size
+            qkv_dh, qkv_dm, qkv_fm = [], [], []
             for gn in ("q_message_gate", "k_message_gate", "v_message_gate", "mlp_message_gate"):
-                # Keep 2D message gate weights in native bfloat16 for 2x bandwidth + Neural Accelerator speed
-                self.msg_gates[gn] = (
-                    st[p + f"{gn}.down_proj.weight"].astype(mx.bfloat16),
-                    st[p + f"{gn}.forget_gate_proj.weight"].astype(mx.bfloat16),
-                    st[p + f"{gn}.message_gate_proj.weight"].astype(mx.bfloat16),
-                )
+                dw = st[p + f"{gn}.down_proj.weight"].astype(mx.bfloat16)
+                fw = st[p + f"{gn}.forget_gate_proj.weight"].astype(mx.bfloat16)
+                mw = st[p + f"{gn}.message_gate_proj.weight"].astype(mx.bfloat16)
+                if self._fast:
+                    fm = mx.concatenate([fw, mw], axis=0)
+                    if gn == "mlp_message_gate":
+                        self.mlp_dh, self.mlp_dm, self.mlp_fm = dw[:, :H], dw[:, H:], fm
+                    else:
+                        qkv_dh.append(dw[:, :H])
+                        qkv_dm.append(dw[:, H:])
+                        qkv_fm.append(fm)
+                else:
+                    self.msg_gates[gn] = (dw, fw, mw)
+            if self._fast:
+                self.qkv_dh3 = mx.stack(qkv_dh, axis=0)
+                self.qkv_dm3 = mx.stack(qkv_dm, axis=0)
+                self.qkv_fm3 = mx.stack(qkv_fm, axis=0)
 
         self.moe = PackedMoE(
-            arrays, luts,
+            arrays, luts, fast_luts,
             st[p + "mlp.gate.weight"],
             st[p + "mlp.gate.e_score_correction_bias"],
             cfg,
         )
+
+    def forward_fast(
+        self,
+        h: mx.array,
+        blocks_cat: mx.array | None,
+        n_blocks: int,
+        q_pos0: int,
+        T: int,
+        cache: Inkling2Cache,
+        cache_slot: int,
+        messages: mx.array | None = None,
+    ) -> mx.array:
+        """Ultra-fast fused Metal path for Inkling-2-Mini (B=1, h shape `[T, 2304]`)."""
+        cfg = self.cfg
+        block_residual = h
+
+        # 1. Attn input AttnRes + optional batched message gates + layernorm + 5-matrix batched RHT-2304
+        use_qkv_sg8 = 5 <= T <= 8
+        if self.is_sliding:
+            if messages is None:
+                if self.attn_in_q is not None:
+                    q_in = block_attn_res_fused(self.attn_in_q, blocks_cat, n_blocks, h, norm_w=self.in_ln)[0]
+                else:
+                    q_in = rms_norm(h, self.in_ln, cfg.rms_norm_eps)
+                x_rot5 = rht_in_2304_fast(q_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=False, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+            else:
+                h_a = block_attn_res_fused(self.attn_in_q, blocks_cat, n_blocks, h)[0]
+                fg_mg3 = _msg_3x_shared_h_compiled(h_a, messages[:3], self.qkv_dh3, self.qkv_dm3, self.qkv_fm3)
+                qkv_in = msg_blend_norm_3x_fused(h_a, messages[:3], fg_mg3, self.in_ln, T, h_shared=True, norm_shared=True)
+                q_in = qkv_in[0]
+                x_rot5 = rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+        else:
+            if self.attn_in_q is None:
+                qkv_h = mx.broadcast_to(h[None, :, :], (3, T, 2304))
+            else:
+                qkv_h = block_attn_res_fused(self.attn_in_q, blocks_cat, n_blocks, h)
+            if messages is not None:
+                fg_mg3 = _msg_3x_split_h_compiled(qkv_h, messages[:3], self.qkv_dh3, self.qkv_dm3, self.qkv_fm3)
+                qkv_in = msg_blend_norm_3x_fused(qkv_h, messages[:3], fg_mg3, self.qkv_in_ln, T, h_shared=False, norm_shared=False)
+                q_in, k_in, v_in = qkv_in[0], qkv_in[1], qkv_in[2]
+            else:
+                q_in = rms_norm(qkv_h[0], self.q_in_ln, cfg.rms_norm_eps)
+                k_in = rms_norm(qkv_h[1], self.k_in_ln, cfg.rms_norm_eps)
+                v_in = rms_norm(qkv_h[2], self.v_in_ln, cfg.rms_norm_eps)
+                qkv_in = mx.stack([q_in, k_in, v_in], axis=0)
+            x_rot5 = rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+
+        # 2. Fused 5-matrix QKV + Rel + O_Gate stage (1 launch!)
+        y_qkv = self.qkv_stage.matmul_rotated_sg8_f16(x_rot5, T=T, rb=1, sg=8, ntg=160) if use_qkv_sg8 else self.qkv_stage.matmul_rotated_f16(x_rot5, T)  # [T, 8576]
+        o_gate_raw = y_qkv[:, 5504:8576]
+        if self.qkv_out_rots[4] is not None:
+            o_gate_raw = rht_apply_out(o_gate_raw, self.qkv_out_rots[4])
+
+        # 3. Fused Q/Rel clip (+log_scale) + K/V conv/norm + FP16 KV append
+        kp = cache.get_conv_prev(cache_slot, 0, 1024)
+        vp = cache.get_conv_prev(cache_slot, 1, 1024)
+        if self.is_sliding and not self.has_qkv_out_rot:
+            q, rel_st, k_f16, v_f16, new_kp, new_vp = qkv_rel_prep_sliding_fused(
+                y_qkv, self.q_scale, self.rel_scale,
+                kp, self.k_conv_w, vp, self.v_conv_w,
+                T, cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
+            )
+            cache.set_conv_after(cache_slot, 0, kp, y_qkv[:, 3072:4096].reshape(1, T, 1024), new_kp)
+            cache.set_conv_after(cache_slot, 1, vp, y_qkv[:, 4096:5120].reshape(1, T, 1024), new_vp)
+        else:
+            q_raw = y_qkv[:, 0:3072]
+            k_raw = y_qkv[:, 3072:4096]
+            v_raw = y_qkv[:, 4096:5120]
+            rel_raw = y_qkv[:, 5120:5504]
+            if self.qkv_out_rots[0] is not None:
+                q_raw = rht_apply_out(q_raw, self.qkv_out_rots[0])
+            if self.qkv_out_rots[1] is not None:
+                k_raw = rht_apply_out(k_raw, self.qkv_out_rots[1])
+            if self.qkv_out_rots[2] is not None:
+                v_raw = rht_apply_out(v_raw, self.qkv_out_rots[2])
+            if self.qkv_out_rots[3] is not None:
+                rel_raw = rht_apply_out(rel_raw, self.qkv_out_rots[3])
+            q, rel_st = q_rel_clip_fused(
+                q_raw, self.q_scale, rel_raw, self.rel_scale,
+                q_pos0, T, self.is_sliding,
+                cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
+                cfg.log_scaling_alpha, cfg.log_scaling_n_floor,
+            )
+            if self.is_sliding:
+                k_f16, v_f16, new_kp, new_vp = kv_sconv4_norm_fused(kp, k_raw, self.k_conv_w, vp, v_raw, self.v_conv_w, T, cfg.qk_l2_clip_threshold)
+            else:
+                k_f16, v_f16, new_kp, new_vp = kv_dyn_sconv4_norm_fused(
+                    kp, k_raw, k_in, self.k_dyn_st, self.k_dyn_pr_f16,
+                    vp, v_raw, v_in, self.v_dyn_st, self.v_dyn_pr_f16,
+                    T, cfg.qk_l2_clip_threshold,
+                )
+            cache.set_conv_after(cache_slot, 0, kp, k_raw.reshape(1, T, 1024), new_kp)
+            cache.set_conv_after(cache_slot, 1, vp, v_raw.reshape(1, T, 1024), new_vp)
+
+        K_buf, V_buf, kv_len, kv_start, kv_cap = cache.update_kv_f16(cache_slot, k_f16, v_f16, self.is_sliding)
+
+        # 4. Fused Sinks + GQA+RelPos Flash-Decoding SDPA (1 launch!)
+        attn_out = gqa_relpos_sinks_sdpa_fast(
+            q, K_buf, V_buf, rel_st, self.rel_proj_t_f16, q_in, self.sink_w_f16,
+            T, kv_len, kv_start, q_pos0, kv_cap, self.is_sliding,
+        )
+
+        # 5. Fused Gate*Attn + RHT-3072 -> O projection -> Post-Attn ShortConv4 (+ Residual)
+        o_rot = rht_in_3072_gated_fast(attn_out, o_gate_raw, self.o_stage.signs_in, out_dtype=mx.float16)
+        o_out = self.o_stage.matmul_rotated_f16(o_rot, T)
+        if self.o_out_rot is not None:
+            o_out = rht_apply_out(o_out, self.o_out_rot)
+        pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
+        if self.is_block_boundary:
+            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None)
+            residual = h_post
+            local_blocks = block_residual[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, block_residual[None, :, :]], axis=0)
+            n_local = n_blocks + 1
+        else:
+            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=block_residual)
+            residual = h_post
+            local_blocks = blocks_cat
+            n_local = n_blocks
+        cache.set_conv_after(cache_slot, 2, pa_prev, o_out.reshape(1, T, 2304), new_pa)
+
+        # 6+7. Fused MLP input AttnRes / MsgBlend + Norm + RHT-2304(gu_signs) -> Unified MoE + post-MLP conv + residual!
+        if messages is None:
+            h_mlp_f16, x_rot_gu = block_attn_res_norm_rht_fast(self.mlp_in_q, local_blocks, n_local, h_post, self.post_attn_ln, self.moe.gu_signs_in)
+        else:
+            h_m = block_attn_res_fused(self.mlp_in_q, local_blocks, n_local, h_post)[0]
+            fg_mg = _msg_1x_compiled(h_m, messages[3], self.mlp_dh, self.mlp_dm, self.mlp_fm)
+            h_mlp_f16, x_rot_gu = msg_blend_norm_rht_fast(h_m, messages[3], fg_mg, self.post_attn_ln, self.moe.gu_signs_in)
+
+        return self.moe.forward_fast_fused_prerot(h_mlp_f16, x_rot_gu, residual, self.post_mlp_conv_w, cache, cache_slot, T)
 
     def __call__(
         self,
@@ -772,12 +1351,11 @@ class PackedDecoderLayer:
             k_in = rms_norm(k_h, self.k_in_ln, cfg.rms_norm_eps)
             v_in = rms_norm(v_h, self.v_in_ln, cfg.rms_norm_eps)
 
-        # Q, K, V projections
         q = self.q_lin(q_in).reshape(B, T, cfg.num_attention_heads, cfg.head_dim)
         q = l2_clip(q * self.q_scale, cfg.qk_l2_clip_threshold)
         if not self.is_sliding:
             q = log_scale(q, position_ids, cfg.log_scaling_alpha, cfg.log_scaling_n_floor)
-        q = q.transpose(0, 2, 1, 3)  # [B, 24, T, 128]
+        q = q.transpose(0, 2, 1, 3)
 
         k_raw = self.k_lin(k_in)
         v_raw = self.v_lin(v_in)
@@ -794,41 +1372,36 @@ class PackedDecoderLayer:
         K_all, V_all = cache.update_kv(cache_slot, k, v, self.is_sliding)
         kv_len = K_all.shape[2]
 
-        # Relative position bias
         rel_st = self.rel_lin(q_in).reshape(B, T, cfg.num_attention_heads, cfg.d_rel)
         rel_st = l2_clip(rel_st * self.rel_scale, cfg.rel_l2_clip_threshold)
         if not self.is_sliding:
             rel_st = log_scale(rel_st, position_ids, cfg.log_scaling_alpha, cfg.log_scaling_n_floor)
-        rel_logits = (rel_st @ self.rel_proj).transpose(0, 2, 1, 3)  # [B, 24, T, rel_extent]
+        rel_logits = (rel_st @ self.rel_proj).transpose(0, 2, 1, 3)
 
-        # Exact causal relative distance [T, kv_len] (zero CPU sync!)
-        q_pos = position_ids[0]  # [T]
+        q_pos = position_ids[0]
         kv_end = cache.seq_len + T
         kv_start = kv_end - kv_len
         kv_pos = mx.arange(kv_start, kv_end, dtype=mx.int32)
-        rel_dist = q_pos[:, None] - kv_pos[None, :]  # [T, kv_len]
+        rel_dist = q_pos[:, None] - kv_pos[None, :]
         valid_rel = (rel_dist >= 0) & (rel_dist < cfg.rel_extent)
         g_idx = mx.clip(rel_dist, 0, cfg.rel_extent - 1)
         pos_bias = mx.where(valid_rel[None, None, :, :], rel_logits[:, :, mx.arange(T)[:, None], g_idx], 0.0)
 
-        # Causal (+ sliding window) mask + zero-copy GQA SDPA with per-token sinks
         if self.is_sliding:
             allowed = (rel_dist >= 0) & (rel_dist < cfg.sliding_window_size)
         else:
             allowed = rel_dist >= 0
-        sinks = (q_in @ self.sink_w.T).transpose(0, 2, 1)[..., None]  # [B, 24, T, 1]
+        sinks = (q_in @ self.sink_w.T).transpose(0, 2, 1)[..., None]
         n_rep = cfg.num_attention_heads // cfg.num_key_value_heads
         attn_out = _gqa_sdpa_sinks(
             q, K_all, V_all, pos_bias, allowed, sinks,
             cfg.num_key_value_heads, n_rep, cfg.head_dim,
         )
 
-        # Gated output projection + post-attention conv
         gate = mx.sigmoid(self.o_gate(q_in))
         attn_out = self.o_lin(attn_out * gate)
         attn_out = short_conv(attn_out, self.post_attn_conv_w, cache, cache_slot, 2)
 
-        # Residual & block boundary
         if self.is_block_boundary:
             local_blocks = block_states + [block_residual.astype(mx.float32)]
             residual = attn_out
@@ -838,26 +1411,27 @@ class PackedDecoderLayer:
             residual = block_residual.astype(mx.float32) + attn_out
             h_post = residual
 
-        # MLP input AttnRes + optional mlp message gate + layernorm
         h_mlp = block_attn_res(self.mlp_in_q, local_blocks, h_post)[0]
         if messages is not None:
             h_mlp = message_gate(h_mlp, messages[3], *self.msg_gates["mlp_message_gate"], cfg.rms_norm_eps)
         h_mlp = rms_norm(h_mlp, self.post_attn_ln, cfg.rms_norm_eps)
 
-        # MoE + post-MLP conv + residual
         mlp_out = self.moe(h_mlp)
         mlp_out = short_conv(mlp_out, self.post_mlp_conv_w, cache, cache_slot, 3)
         return residual + mlp_out
 
 
 class Inkling2LoopPackedMLX:
-    """Complete standalone Inkling-2-Mini text model running directly from packed 8.85 GB artifacts on Apple Silicon."""
+    """Complete standalone Inkling-2-Mini text model running directly from packed artifacts on Apple Silicon."""
 
     def __init__(self, packed_dir: str | Path, steering_override: str | Path | None = None):
         self.packed_dir = Path(packed_dir)
         self.cfg = Inkling2Config.from_json(self.packed_dir / "config.json")
+        self._fast = self.cfg.use_fast_metal
         lut_npz = np.load(self.packed_dir / "luts.npz")
         self.luts = {k: mx.array(lut_npz[k]) for k in lut_npz.files}
+        self.fast_luts = build_fast_luts(self.luts) if self._fast else None
+
         st_raw = mx.load(str(self.packed_dir / "steering.safetensors"))
         if steering_override is not None:
             ov = mx.load(str(steering_override))
@@ -867,24 +1441,127 @@ class Inkling2LoopPackedMLX:
         self.embed = PackedEmbed(self.packed_dir, self.luts, self.st["model.embed_tokens.embed_norm.weight"], self.cfg.rms_norm_eps)
         self.final_in_q = self.st["model.final_input.query"].astype(mx.float32)
         self.final_norm_w = self.st["model.norm.weight"].astype(mx.float32)
-        self.message_in_q = self.st["model.message_input.query"].astype(mx.float32)  # [12, 4, 2304]
-        self.layers = [PackedDecoderLayer(i, self.cfg, self.packed_dir, self.luts, self.st) for i in range(self.cfg.num_hidden_layers)]
-        self.lm_head = PackedLMHead(self.packed_dir, self.luts, self.cfg.final_logit_softcapping)
+        self.message_in_q = self.st["model.message_input.query"].astype(mx.float32)
+        self.layers = [PackedDecoderLayer(i, self.cfg, self.packed_dir, self.luts, self.fast_luts, self.st) for i in range(self.cfg.num_hidden_layers)]
+        self.lm_head = PackedLMHead(self.packed_dir, self.luts, self.fast_luts, self.cfg.final_logit_softcapping, self.cfg.hidden_size)
 
     def make_cache(self) -> Inkling2Cache:
         return Inkling2Cache(self.cfg)
 
+    def _forward_core_fast(
+        self,
+        input_ids: list[int] | np.ndarray | mx.array,
+        cache: Inkling2Cache,
+        all_logits: bool = False,
+        argmax_only: bool = False,
+        tap_visits: tuple[int, ...] = (),
+    ):
+        cfg = self.cfg
+        h = self.embed(input_ids)[0]  # [T, 2304]
+        T = int(h.shape[0])
+        q_pos0 = cache.seq_len
+        blocks_cat: mx.array | None = None
+        n_blocks = 0
+        tap_set = set(tap_visits)
+        captured: dict[int, mx.array] = {}
+        visit = 0
+
+        # 1. Pre-loop layers (L0..5)
+        for i in range(cfg.loop_start):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if T <= 8 and (visit & 3) == 0:
+                mx.async_eval(h)
+
+        pre_loop_h = h
+        pre_loop_blocks = blocks_cat
+        num_pre = n_blocks
+
+        # 2. Pass 0 over loop layers (L6..17)
+        for i in range(cfg.loop_start, cfg.loop_end):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if T <= 8 and (visit & 3) == 0:
+                mx.async_eval(h)
+
+        # 3. Passes 1..loop_passes-1 over loop layers with cross-pass messages
+        num_loop = cfg.loop_end - cfg.loop_start
+        for loop_idx in range(1, cfg.loop_passes):
+            prev_n = n_blocks - (num_pre + 1)
+            prev_blocks = blocks_cat[num_pre + 1 :] if prev_n > 0 else None
+            prev_h = h
+            h = pre_loop_h
+            blocks_cat = pre_loop_blocks
+            n_blocks = num_pre
+            cache_offset = cfg.num_hidden_layers + (loop_idx - 1) * num_loop - cfg.loop_start
+            for loop_layer_idx, i in enumerate(range(cfg.loop_start, cfg.loop_end)):
+                if visit in tap_set:
+                    captured[visit] = h
+                L = self.layers[i]
+                msgs = block_attn_res_fused(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)  # [4, T, 2304]
+                new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset, messages=msgs)
+                if L.is_block_boundary:
+                    blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                    n_blocks += 1
+                h = new_h
+                visit += 1
+                if T <= 8 and (visit & 3) == 0:
+                    mx.async_eval(h)
+
+        # 4. Post-loop layers (L18..23)
+        for i in range(cfg.loop_end, cfg.num_hidden_layers):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if T <= 8 and (visit & 3) == 0 and visit < 48:
+                mx.async_eval(h)
+
+        # 5. Final AttnRes + norm + unpadded lm_head
+        h = block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]  # [T, 2304]
+        if visit in tap_set:
+            captured[visit] = h
+        cache.seq_len += T
+        h_in = h[None, :, :] if all_logits else h[-1:, :][None, :, :]
+        out = self.lm_head.argmax(h_in) if argmax_only else self.lm_head(h_in)
+        if tap_visits:
+            taps = mx.stack([captured[v] for v in tap_visits], axis=1)  # [T, len(taps), H]
+            return out, cache, taps
+        return out, cache
+
     def _forward_core(
         self,
-        input_ids: list[int] | np.ndarray,
+        input_ids: list[int] | np.ndarray | mx.array,
         cache: Inkling2Cache | None = None,
         all_logits: bool = False,
+        argmax_only: bool = False,
         tap_visits: tuple[int, ...] = (),
     ):
         if cache is None:
             cache = self.make_cache()
+        if self._fast:
+            return self._forward_core_fast(input_ids, cache, all_logits=all_logits, argmax_only=argmax_only, tap_visits=tap_visits)
         cfg = self.cfg
-        h = self.embed(input_ids)  # [1, T, H]
+        h = self.embed(input_ids)
         T = h.shape[1]
         position_ids = mx.arange(cache.seq_len, cache.seq_len + T, dtype=mx.int32)[None, :]
         block_states: list[mx.array] = []
@@ -892,7 +1569,6 @@ class Inkling2LoopPackedMLX:
         captured: dict[int, mx.array] = {}
         visit = 0
 
-        # 1. Pre-loop layers (L0..5)
         for i in range(cfg.loop_start):
             if visit in tap_set:
                 captured[visit] = h[0].astype(mx.float32)
@@ -907,7 +1583,6 @@ class Inkling2LoopPackedMLX:
         pre_loop_blocks = list(block_states)
         num_pre = len(pre_loop_blocks)
 
-        # 2. Pass 0 over loop layers (L6..17)
         for i in range(cfg.loop_start, cfg.loop_end):
             if visit in tap_set:
                 captured[visit] = h[0].astype(mx.float32)
@@ -918,7 +1593,6 @@ class Inkling2LoopPackedMLX:
             h = new_h
             visit += 1
 
-        # 3. Passes 1..loop_passes-1 over loop layers with cross-pass messages
         num_loop = cfg.loop_end - cfg.loop_start
         for loop_idx in range(1, cfg.loop_passes):
             prev_blocks = block_states[num_pre + 1 :]
@@ -937,7 +1611,6 @@ class Inkling2LoopPackedMLX:
                 h = new_h
                 visit += 1
 
-        # 4. Post-loop layers (L18..23)
         for i in range(cfg.loop_end, cfg.num_hidden_layers):
             if visit in tap_set:
                 captured[visit] = h[0].astype(mx.float32)
@@ -948,23 +1621,29 @@ class Inkling2LoopPackedMLX:
             h = new_h
             visit += 1
 
-        # 5. Final AttnRes + norm + unpadded lm_head + softcap
         h = block_attn_res(self.final_in_q, block_states, h)[0]
         h = rms_norm(h, self.final_norm_w, cfg.rms_norm_eps)
         if visit in tap_set:
             captured[visit] = h[0].astype(mx.float32)
         cache.seq_len += T
-        logits = self.lm_head(h if all_logits else h[:, -1:, :])
+        h_in = h if all_logits else h[:, -1:, :]
+        out = self.lm_head.argmax(h_in) if argmax_only else self.lm_head(h_in)
         if tap_visits:
-            taps = mx.stack([captured[v] for v in tap_visits], axis=1)  # [T, len(taps), H]
-            return logits, cache, taps
-        return logits, cache
+            taps = mx.stack([captured[v] for v in tap_visits], axis=1)
+            return out, cache, taps
+        return out, cache
 
-    def forward(self, input_ids: list[int] | np.ndarray, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
-        return self._forward_core(input_ids, cache=cache, all_logits=False, tap_visits=tap_visits)
+    def forward(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
+        return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=False, tap_visits=tap_visits)
 
-    def forward_all_logits(self, input_ids: list[int] | np.ndarray, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
-        return self._forward_core(input_ids, cache=cache, all_logits=True, tap_visits=tap_visits)
+    def forward_all_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
+        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=False, tap_visits=tap_visits)
+
+    def forward_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
+        return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=True, tap_visits=tap_visits)
+
+    def forward_all_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
+        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=True, tap_visits=tap_visits)
 
 
 class Inkling2MLXModel:

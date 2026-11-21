@@ -319,9 +319,17 @@ def test_moe_grouped_large_expert_count_parity() -> None:
             assert err < 2e-3, f"Slot {s} expert {eid} mismatch: {err}"
 
 
+def test_fast_kernels_suite() -> None:
+    """Verify all H=2304 Apple Silicon fast Metal kernels against exact references."""
+    from runtime_mlx.inkling.fast_kernels import _selftest
+
+    _selftest()
+
+
 def main() -> None:
     test_mini_model_and_runtime_integration()
     test_moe_grouped_large_expert_count_parity()
+    test_fast_kernels_suite()
     print("ALL INKLING MLX RUNTIME TESTS PASSED!", flush=True)
 
 

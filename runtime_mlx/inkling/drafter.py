@@ -3,29 +3,23 @@
 Matches SGLang's `Inkling2ForConditionalGenerationMTP` (`inkling2_mtp.py` + `inkling2_mtp_ops.py`) line-for-line:
   - Reads 4 target hidden taps (`target_layer_ids = [5, 23, 41, 48]`: inputs to logical visits 5, 23, 41 + final norm state 48).
   - Mixes the 4 taps per layer (`fuse_alpha = softmax(fuse_weight)` row `i`) via `mix_rmsnorm` with `layer.dflare_norm`.
-  - Appends projected context KV (`k_proj_ctx`, `v_proj_ctx`, `k_norm_ctx`, RoPE `theta=1e6`) to each of the 3 DSpark layers.
+  - Appends projected context KV (`k_proj_ctx`, `v_proj_ctx`, `k_norm_ctx`, RoPE `theta=1e6`) in `float16` to each of the 3 DSpark layers.
   - Drafts a block of 8 tokens (`[anchor_embed, mask_embed x 7]`) in parallel through the 3 bidirectional-block layers
-    (`local_layer_ids = [0, 2]` sliding `1024`, layer `1` full attention) attending over `[ctx_kv, self_block_kv]`.
-  - Runs the sequential `Inkling2MTPHead` (`rnn_hidden`, rank 256) over steps `s = 1..7`, feeding
-    `hidden_draft[s] + hidden_out(latent)` into the target's packed `lm_head` + `softcap(30.0)`.
-  - Quantizes all 3 layers' dense linear projections + `markov_w1` / `rnn_proj` to 4-bit MLX (`group_size=64`,
-    ~169 MB total vs 635.8 MB BF16) while preserving norms, `fuse_weight`, `mask_embed`, and `hidden_out` in native precision.
-  - Includes self-calibrating adaptive serial fallback (from LookatmyQuant `dfd8bfe`): monitors rolling acceptance
-    and temporarily switches to exact serial decode when acceptance falls below break-even.
+    using native `mx.fast.scaled_dot_product_attention` over `[ctx_kv, self_block_kv]`.
+  - Runs the sequential `Inkling2MTPHead` (`rnn_hidden`, rank 256) over steps `s = 1..draft_len-1` with ZERO CPU↔GPU syncs,
+    optionally scoring against the target's lazy 32K MLX-4bit draft shortlist head (verified against the target's full 200K head).
 """
 from __future__ import annotations
 
 import json
 import math
-import time
 from pathlib import Path
-from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .model import rms_norm, softcap
+from .model import rms_norm
 
 
 def quantize_mtp_to_4bit(src_safetensors: str | Path, dst_safetensors: str | Path, group_size: int = 64, bits: int = 4) -> dict:
@@ -33,7 +27,6 @@ def quantize_mtp_to_4bit(src_safetensors: str | Path, dst_safetensors: str | Pat
     src_w = mx.load(str(src_safetensors))
     out: dict[str, mx.array] = {}
     q_keys = []
-    # Quantize all 2D weight matrices >= 1 MB (all 3 layers' QKV/O/MLP + markov_w1 + rnn_proj)
     for k, v in src_w.items():
         if v.ndim == 2 and v.shape[1] % group_size == 0 and v.nbytes >= 1_000_000:
             wq, sc, bi = mx.quantize(v, group_size=group_size, bits=bits)
@@ -59,27 +52,42 @@ def quantize_mtp_to_4bit(src_safetensors: str | Path, dst_safetensors: str | Pat
     }
 
 
-def _apply_rope(x: mx.array, positions: mx.array, theta: float = 1_000_000.0) -> mx.array:
-    # x: [B, n_heads, T, head_dim], positions: [T]
-    hd = x.shape[-1]
-    half = hd // 2
-    inv_freq = mx.exp(-math.log(theta) * mx.arange(0, half, dtype=mx.float32) / float(half))
-    freqs = positions.astype(mx.float32)[:, None] * inv_freq[None, :]  # [T, half]
+@mx.compile
+def _apply_rope_compiled(x: mx.array, positions: mx.array, inv_freq: mx.array) -> mx.array:
+    freqs = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
     cos = mx.cos(freqs)[None, None, :, :]
     sin = mx.sin(freqs)[None, None, :, :]
     xf = x.astype(mx.float32)
+    half = xf.shape[-1] // 2
     x1, x2 = xf[..., :half], xf[..., half:]
     return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
-def _mix_rmsnorm(targets: mx.array, alpha: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
-    # targets: [T, 4, H], alpha: [4] -> [T, H]
+@mx.compile
+def _mix_rmsnorm_compiled(targets: mx.array, alpha: mx.array, weight: mx.array) -> mx.array:
     mixed = mx.sum(targets.astype(mx.float32) * alpha[None, :, None], axis=1)
-    return rms_norm(mixed, weight, eps)
+    return mx.fast.rms_norm(mixed, weight, 1e-6)
+
+
+@mx.compile
+def _rnn_update_compiled(state: mx.array, proj: mx.array) -> tuple[mx.array, mx.array]:
+    gate_raw, cand_raw, out_raw = mx.split(proj, 3, axis=0)
+    gate = mx.sigmoid(gate_raw)
+    new_state = gate * state + (1.0 - gate) * mx.tanh(cand_raw)
+    latent = mx.tanh(out_raw)
+    return new_state, latent
+
+
+@mx.compile
+def _silu_mul_compiled(gate_up: mx.array) -> mx.array:
+    g, u = mx.split(gate_up, 2, axis=-1)
+    return nn.silu(g) * u
 
 
 class _QLinear:
-    def __init__(self, weights: dict[str, mx.array], key: str, bits: int = 4, group_size: int = 64):
+    def __init__(self, weights: dict[str, mx.array] | None, key: str = "", bits: int = 4, group_size: int = 64):
+        if weights is None:
+            return
         self.w = weights[key]
         self.quantized = (key + ".scales") in weights
         if self.quantized:
@@ -90,13 +98,31 @@ class _QLinear:
         else:
             self.w = self.w.astype(mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    @classmethod
+    def concat(cls, linears: list["_QLinear"]) -> "_QLinear":
+        """Fuse multiple `_QLinear` projections sharing the same input into ONE quantized/dense matmul."""
+        out = cls(None)
+        out.quantized = all(lin.quantized for lin in linears)
+        if out.quantized:
+            out.w = mx.concatenate([lin.w for lin in linears], axis=0)
+            out.scales = mx.concatenate([lin.scales for lin in linears], axis=0)
+            out.biases = mx.concatenate([lin.biases for lin in linears], axis=0)
+            out.bits = linears[0].bits
+            out.group_size = linears[0].group_size
+        else:
+            out.w = mx.concatenate([lin.w.astype(mx.float32) for lin in linears], axis=0)
+        return out
+
+    def __call__(self, x: mx.array, out_dtype=mx.float32) -> mx.array:
         if self.quantized:
-            return mx.quantized_matmul(
-                x.astype(mx.bfloat16), self.w, self.scales, self.biases,
+            y = mx.quantized_matmul(
+                x.astype(mx.bfloat16) if x.dtype != mx.bfloat16 else x,
+                self.w, self.scales, self.biases,
                 transpose=True, group_size=self.group_size, bits=self.bits,
-            ).astype(mx.float32)
-        return x.astype(mx.float32) @ self.w.T
+            )
+            return y if y.dtype == out_dtype else y.astype(out_dtype)
+        y = x.astype(mx.float32) @ self.w.T
+        return y if y.dtype == out_dtype else y.astype(out_dtype)
 
 
 class _QEmbedding:
@@ -139,122 +165,181 @@ class DSparkDrafterMLX:
         self.markov_rank = int(mc["markov_rank"])
         self.target_layer_ids = tuple(mc["target_layer_ids"])
         self.softcap = float(tc["final_logit_softcapping"])
+        self._sdpa_scale = self.head_dim ** -0.5
+
+        half = self.head_dim // 2
+        self._inv_freq = mx.exp(-math.log(self.rope_theta) * mx.arange(0, half, dtype=mx.float32) / float(half))
 
         w = mx.load(str(mtp_path))
-        self.fuse_alpha = mx.softmax(w["fuse_weight"].astype(mx.float32), axis=-1)  # [4, 4]
-        self.mask_embed = w["mask_embed"].astype(mx.float32)  # [H]
-        self.final_norm = w["norm.weight"].astype(mx.float32)  # [H]
+        self.fuse_alpha = mx.softmax(w["fuse_weight"].astype(mx.float32), axis=-1)
+        self.mask_embed = w["mask_embed"].astype(mx.bfloat16)
+        self.final_norm = w["norm.weight"].astype(mx.float32)
 
         self.layers = []
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        self._q_dim = q_dim
+        self._kv_dim = kv_dim
         for i in range(self.num_layers):
             p = f"layers.{i}."
+            q_lin = _QLinear(w, p + "self_attn.q_proj.weight", bits, group_size)
+            k_lin = _QLinear(w, p + "self_attn.k_proj.weight", bits, group_size)
+            v_lin = _QLinear(w, p + "self_attn.v_proj.weight", bits, group_size)
+            k_ctx = _QLinear(w, p + "self_attn.k_proj_ctx.weight", bits, group_size)
+            v_ctx = _QLinear(w, p + "self_attn.v_proj_ctx.weight", bits, group_size)
+            gate_lin = _QLinear(w, p + "mlp.gate_proj.weight", bits, group_size)
+            up_lin = _QLinear(w, p + "mlp.up_proj.weight", bits, group_size)
             self.layers.append({
                 "dflare_norm": w[p + "dflare_norm.weight"].astype(mx.float32),
-                "in_ln": w[p + "input_layernorm.weight"].astype(mx.float32),
-                "post_ln": w[p + "post_attention_layernorm.weight"].astype(mx.float32),
-                "q_norm": w[p + "self_attn.q_norm.weight"].astype(mx.float32),
-                "k_norm": w[p + "self_attn.k_norm.weight"].astype(mx.float32),
-                "k_norm_ctx": w[p + "self_attn.k_norm_ctx.weight"].astype(mx.float32),
-                "q_proj": _QLinear(w, p + "self_attn.q_proj.weight", bits, group_size),
-                "k_proj": _QLinear(w, p + "self_attn.k_proj.weight", bits, group_size),
-                "v_proj": _QLinear(w, p + "self_attn.v_proj.weight", bits, group_size),
-                "k_proj_ctx": _QLinear(w, p + "self_attn.k_proj_ctx.weight", bits, group_size),
-                "v_proj_ctx": _QLinear(w, p + "self_attn.v_proj_ctx.weight", bits, group_size),
+                "in_ln": w[p + "input_layernorm.weight"].astype(mx.bfloat16),
+                "post_ln": w[p + "post_attention_layernorm.weight"].astype(mx.bfloat16),
+                "q_norm": w[p + "self_attn.q_norm.weight"].astype(mx.bfloat16),
+                "k_norm": w[p + "self_attn.k_norm.weight"].astype(mx.bfloat16),
+                "k_norm_ctx": w[p + "self_attn.k_norm_ctx.weight"].astype(mx.bfloat16),
+                "qkv_proj": _QLinear.concat([q_lin, k_lin, v_lin]),
+                "kv_ctx_proj": _QLinear.concat([k_ctx, v_ctx]),
                 "o_proj": _QLinear(w, p + "self_attn.o_proj.weight", bits, group_size),
-                "gate_proj": _QLinear(w, p + "mlp.gate_proj.weight", bits, group_size),
-                "up_proj": _QLinear(w, p + "mlp.up_proj.weight", bits, group_size),
+                "gate_up_proj": _QLinear.concat([gate_lin, up_lin]),
                 "down_proj": _QLinear(w, p + "mlp.down_proj.weight", bits, group_size),
             })
 
-        # Markov RNN-hidden head
         self.markov_w1 = _QEmbedding(w, "markov_head.markov_w1.weight", bits, group_size)
         self.rnn_proj_w = _QLinear(w, "markov_head.rnn_proj.weight", bits, group_size)
         self.rnn_proj_b = w["markov_head.rnn_proj.bias"].astype(mx.float32)
         self.hidden_out_w = _QLinear(w, "markov_head.hidden_out.weight", bits, group_size)
-        self.hidden_out_b = w["markov_head.hidden_out.bias"].astype(mx.float32)    # [2304]
+        self.hidden_out_b = w["markov_head.hidden_out.bias"].astype(mx.float32)
         self.head_dflare_norm = w["markov_head.dflare_norm.weight"].astype(mx.float32)
+        self._zero_state = mx.zeros((self.markov_rank,), dtype=mx.float32)
+        eval_items = [self._inv_freq, self.fuse_alpha, self.mask_embed, self.final_norm, self._zero_state]
+        for L in self.layers:
+            for k_name in ("qkv_proj", "kv_ctx_proj", "gate_up_proj"):
+                lin = L[k_name]
+                eval_items.append(lin.w)
+                if lin.quantized:
+                    eval_items.extend([lin.scales, lin.biases])
+        mx.eval(*eval_items)
 
         self.reset()
 
     def reset(self):
         self.ctx_k: list[mx.array | None] = [None] * self.num_layers
         self.ctx_v: list[mx.array | None] = [None] * self.num_layers
+        self._ctx_cur: list[int] = [0] * self.num_layers
+        self._ctx_cap: list[int] = [0] * self.num_layers
         self.ctx_len: int = 0
         self.f_rnn: mx.array | None = None
+
+    def _ensure_ctx_cap(self, i: int, need: int):
+        if self.ctx_k[i] is None or need > self._ctx_cap[i]:
+            new_cap = ((need + 255) // 256) * 256
+            K_new = mx.zeros((1, self.num_kv_heads, new_cap, self.head_dim), dtype=mx.float16)
+            V_new = mx.zeros((1, self.num_kv_heads, new_cap, self.head_dim), dtype=mx.float16)
+            cur = self._ctx_cur[i]
+            if self.ctx_k[i] is not None and cur > 0:
+                K_new[:, :, :cur, :] = self.ctx_k[i][:, :, :cur, :]
+                V_new[:, :, :cur, :] = self.ctx_v[i][:, :, :cur, :]
+            self.ctx_k[i] = K_new
+            self.ctx_v[i] = V_new
+            self._ctx_cap[i] = new_cap
 
     def push_context(self, target_taps: mx.array, start_pos: int):
         """Ingest committed target hidden taps `[T, 4, H]` starting at `start_pos`."""
         T = int(target_taps.shape[0])
-        positions = mx.arange(start_pos, start_pos + T, dtype=mx.int32)
+        kv_dim = self._kv_dim
         for i, L in enumerate(self.layers):
-            ctx = _mix_rmsnorm(target_taps, self.fuse_alpha[i], L["dflare_norm"], self.eps)  # [T, H]
-            k = L["k_proj_ctx"](ctx).reshape(1, T, self.num_kv_heads, self.head_dim)
-            v = L["v_proj_ctx"](ctx).reshape(1, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-            k = rms_norm(k, L["k_norm_ctx"], self.eps).transpose(0, 2, 1, 3)
-            k = _apply_rope(k, positions, self.rope_theta)
-            if self.ctx_k[i] is None:
-                self.ctx_k[i], self.ctx_v[i] = k, v
-            else:
-                self.ctx_k[i] = mx.concatenate([self.ctx_k[i], k], axis=2)
-                self.ctx_v[i] = mx.concatenate([self.ctx_v[i], v], axis=2)
-            if i in self.local_layers and self.ctx_k[i].shape[2] > self.window:
-                self.ctx_k[i] = self.ctx_k[i][:, :, -self.window :, :]
-                self.ctx_v[i] = self.ctx_v[i][:, :, -self.window :, :]
-        self.ctx_len = start_pos + T
-        self.f_rnn = _mix_rmsnorm(target_taps[-1:], self.fuse_alpha[self.num_layers], self.head_dflare_norm, self.eps)[0]
+            ctx = _mix_rmsnorm_compiled(target_taps, self.fuse_alpha[i], L["dflare_norm"])
+            kv = L["kv_ctx_proj"](ctx, out_dtype=mx.bfloat16)
+            k = kv[:, :kv_dim].reshape(1, T, self.num_kv_heads, self.head_dim)
+            v = kv[:, kv_dim:].reshape(1, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3).astype(mx.float16)
+            k = mx.fast.rms_norm(k, L["k_norm_ctx"], self.eps).transpose(0, 2, 1, 3)
+            k = mx.fast.rope(k, self.head_dim, traditional=False, base=self.rope_theta, scale=1.0, offset=start_pos).astype(mx.float16)
 
-    def propose(self, anchor_tok: int, embed_fn, lm_head_fn) -> list[int]:
-        """Propose a block of `block_size` tokens `[anchor_tok, d1, ..., d7]`."""
+            cur = self._ctx_cur[i]
+            need = cur + T + self.block_size
+            if i in self.local_layers and cur + T > self.window + 256 and self.ctx_k[i] is not None:
+                shift = cur - self.window
+                K_old, V_old = self.ctx_k[i], self.ctx_v[i]
+                new_cap = max(self._ctx_cap[i], ((self.window + T + self.block_size + 255) // 256) * 256)
+                K_new = mx.zeros((1, self.num_kv_heads, new_cap, self.head_dim), dtype=mx.float16)
+                V_new = mx.zeros((1, self.num_kv_heads, new_cap, self.head_dim), dtype=mx.float16)
+                K_new[:, :, : self.window, :] = K_old[:, :, shift:cur, :]
+                V_new[:, :, : self.window, :] = V_old[:, :, shift:cur, :]
+                self.ctx_k[i], self.ctx_v[i], self._ctx_cap[i] = K_new, V_new, new_cap
+                cur = self.window
+                need = cur + T + self.block_size
+            self._ensure_ctx_cap(i, need)
+            self.ctx_k[i][:, :, cur : cur + T, :] = k
+            self.ctx_v[i][:, :, cur : cur + T, :] = v
+            self._ctx_cur[i] = cur + T
+        self.ctx_len = start_pos + T
+        self.f_rnn = _mix_rmsnorm_compiled(target_taps[-1:], self.fuse_alpha[self.num_layers], self.head_dflare_norm)[0]
+
+    def _run_3layers(self, anc_emb: mx.array) -> mx.array:
         B_len = self.block_size
-        anc_emb = embed_fn([anchor_tok])[0, 0, :]  # [H]
         masks = mx.broadcast_to(self.mask_embed[None, :], (B_len - 1, self.hidden_size))
-        h = mx.concatenate([anc_emb[None, :], masks], axis=0)  # [8, H]
-        positions = mx.arange(self.ctx_len, self.ctx_len + B_len, dtype=mx.int32)
+        h = mx.concatenate([anc_emb.astype(mx.bfloat16)[None, :], masks], axis=0)
+        q_dim = self._q_dim
+        qk_dim = q_dim + self._kv_dim
+        off = self.ctx_len
 
         for i, L in enumerate(self.layers):
             res = h
-            xn = rms_norm(h, L["in_ln"], self.eps)
-            q = L["q_proj"](xn).reshape(1, B_len, self.num_heads, self.head_dim)
-            k = L["k_proj"](xn).reshape(1, B_len, self.num_kv_heads, self.head_dim)
-            v = L["v_proj"](xn).reshape(1, B_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-            q = _apply_rope(rms_norm(q, L["q_norm"], self.eps).transpose(0, 2, 1, 3), positions, self.rope_theta)
-            k = _apply_rope(rms_norm(k, L["k_norm"], self.eps).transpose(0, 2, 1, 3), positions, self.rope_theta)
+            xn = mx.fast.rms_norm(h, L["in_ln"], self.eps)
+            qkv = L["qkv_proj"](xn, out_dtype=mx.bfloat16)
+            q = qkv[:, :q_dim].reshape(1, B_len, self.num_heads, self.head_dim)
+            k = qkv[:, q_dim:qk_dim].reshape(1, B_len, self.num_kv_heads, self.head_dim)
+            v = qkv[:, qk_dim:].reshape(1, B_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3).astype(mx.float16)
+            q = mx.fast.rope(mx.fast.rms_norm(q, L["q_norm"], self.eps).transpose(0, 2, 1, 3), self.head_dim, traditional=False, base=self.rope_theta, scale=1.0, offset=off).astype(mx.float16)
+            k = mx.fast.rope(mx.fast.rms_norm(k, L["k_norm"], self.eps).transpose(0, 2, 1, 3), self.head_dim, traditional=False, base=self.rope_theta, scale=1.0, offset=off).astype(mx.float16)
 
-            K_all = mx.concatenate([self.ctx_k[i], k], axis=2) if self.ctx_k[i] is not None else k
-            V_all = mx.concatenate([self.ctx_v[i], v], axis=2) if self.ctx_v[i] is not None else v
-            K_exp = mx.repeat(K_all, self.n_rep, axis=1)
-            V_exp = mx.repeat(V_all, self.n_rep, axis=1)
-
-            # Bidirectional inside the 8-token draft block, attending to all cached ctx + self block!
-            scores = mx.matmul(q, K_exp.transpose(0, 1, 3, 2)) * (self.head_dim ** -0.5)
-            probs = mx.softmax(scores, axis=-1)
-            attn_out = mx.matmul(probs, V_exp).transpose(0, 2, 1, 3).reshape(B_len, self.num_heads * self.head_dim)
-            h = res + L["o_proj"](attn_out)
+            cur = self._ctx_cur[i]
+            self._ensure_ctx_cap(i, cur + B_len)
+            self.ctx_k[i][:, :, cur : cur + B_len, :] = k
+            self.ctx_v[i][:, :, cur : cur + B_len, :] = v
+            lo = max(0, cur - self.window) if i in self.local_layers else 0
+            K_all = self.ctx_k[i][:, :, lo : cur + B_len, :]
+            V_all = self.ctx_v[i][:, :, lo : cur + B_len, :]
+            attn_out = mx.fast.scaled_dot_product_attention(q, K_all, V_all, scale=self._sdpa_scale)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B_len, self.num_heads * self.head_dim).astype(mx.bfloat16)
+            h = res + L["o_proj"](attn_out, out_dtype=mx.bfloat16)
 
             res2 = h
-            mn = rms_norm(h, L["post_ln"], self.eps)
-            h = res2 + L["down_proj"](nn.silu(L["gate_proj"](mn)) * L["up_proj"](mn))
+            mn = mx.fast.rms_norm(h, L["post_ln"], self.eps)
+            h = res2 + L["down_proj"](_silu_mul_compiled(L["gate_up_proj"](mn, out_dtype=mx.bfloat16)), out_dtype=mx.bfloat16)
 
-        h = rms_norm(h, self.final_norm, self.eps)  # [8, H]
+        return rms_norm(h, self.final_norm, self.eps)
 
-        # Sequential RNN-hidden Markov head over positions 1..7
-        state = mx.zeros((self.markov_rank,), dtype=mx.float32)
-        prev_tok = anchor_tok
-        draft = [anchor_tok]
-        for s in range(1, B_len):
-            prev_emb = self.markov_w1(mx.array([prev_tok], dtype=mx.int32))[0]
-            inp = mx.concatenate([state, prev_emb, h[s], self.f_rnn], axis=0)[None, :]  # [1, 5120]
-            proj = (self.rnn_proj_w(inp) + self.rnn_proj_b)[0]  # [768]
-            gate_raw, cand_raw, out_raw = mx.split(proj, 3, axis=0)
-            gate = mx.sigmoid(gate_raw)
-            state = gate * state + (1.0 - gate) * mx.tanh(cand_raw)
-            latent = mx.tanh(out_raw)
+    def propose_gpu(self, anchor_tok: int | mx.array, embed_fn, head_argmax_fn, draft_len: int | None = None) -> mx.array:
+        """Zero-sync GPU block proposal returning `int32[draft_len]` (`[anchor, d1, ..., d_{draft_len-1}]`)."""
+        n_toks = self.block_size if draft_len is None else max(2, min(int(draft_len), self.block_size))
+        anc_mx = anchor_tok.reshape(1).astype(mx.int32) if isinstance(anchor_tok, mx.array) else mx.array([int(anchor_tok)], dtype=mx.int32)
+        anc_emb = embed_fn(anc_mx)[0, 0, :]
+        h = self._run_3layers(anc_emb)
+
+        state = self._zero_state
+        prev_tok = anc_mx
+        toks = [anc_mx]
+        for s in range(1, n_toks):
+            prev_emb = self.markov_w1(prev_tok)[0]
+            inp = mx.concatenate([state, prev_emb, h[s], self.f_rnn], axis=0)[None, :]
+            proj = (self.rnn_proj_w(inp) + self.rnn_proj_b)[0]
+            state, latent = _rnn_update_compiled(state, proj)
             delta_h = self.hidden_out_w(latent[None, :])[0] + self.hidden_out_b
-            logits_s = lm_head_fn((h[s] + delta_h)[None, None, :])[0, 0]
-            nxt = int(mx.argmax(logits_s))
-            draft.append(nxt)
+            nxt = head_argmax_fn(h[s] + delta_h).reshape(1).astype(mx.int32)
+            toks.append(nxt)
             prev_tok = nxt
-        return draft
+        return mx.concatenate(toks, axis=0)
+
+    def propose(self, anchor_tok: int, embed_fn, lm_head_fn) -> list[int]:
+        """Propose a block of `block_size` tokens `[anchor_tok, d1, ..., d7]`."""
+        if hasattr(lm_head_fn, "get_draft_head_argmax"):
+            head_argmax_fn = lm_head_fn.get_draft_head_argmax()
+        elif hasattr(lm_head_fn, "argmax"):
+            head_argmax_fn = lambda h1: lm_head_fn.argmax(h1[None, None, :])[0, 0]
+        else:
+            head_argmax_fn = lambda h1: mx.argmax(lm_head_fn(h1[None, None, :])[0, 0])
+        draft_gpu = self.propose_gpu(anchor_tok, embed_fn, head_argmax_fn)
+        return np.array(draft_gpu, dtype=np.int32).tolist()
 
 
 def resolve_drafter_files(path: str | Path, fallback_config: str | Path | None = None) -> tuple[Path, Path]:
