@@ -8,7 +8,8 @@ from typing import Any, Iterator, Sequence
 import mlx.core as mx
 import numpy as np
 
-from .drafter import DSparkDrafterMLX
+from .drafter import TREE_TOPOLOGIES, DSparkDrafterMLX
+from .fast_kernels import make_tree_spec
 from .model import Inkling2LoopPackedMLX, Inkling2MLXModel
 
 
@@ -123,15 +124,20 @@ def stream_dspark(
     eos_ids: set[int] | Sequence[int] = (200006,),
     adaptive: bool = True,
     draft_len: int | None = None,
+    tree: str | None = None,
     stats_out: dict[str, Any] | None = None,
 ) -> Iterator[list[int]]:
-    """Stream exact greedy DSpark block speculative generation with zero-sync propose+verify and adaptive fallback."""
+    """Stream exact greedy DSpark block or tree speculative generation with zero-sync propose+verify and adaptive fallback."""
     m = _unwrap_model(model)
     eos = set(int(x) for x in eos_ids)
     tap_ids = drafter.target_layer_ids  # (5, 23, 41, 48)
     fixed_block = None if draft_len is None else max(2, min(int(draft_len), drafter.block_size))
     cur_block = fixed_block if fixed_block is not None else min(6, drafter.block_size)
-    draft_head = m.lm_head.get_draft_head_argmax()
+    if tree is not None and tree not in TREE_TOPOLOGIES:
+        raise ValueError(f"Unknown tree topology {tree!r}; expected one of {tuple(TREE_TOPOLOGIES)}")
+    tree_spec = make_tree_spec(TREE_TOPOLOGIES[tree]) if tree is not None else None
+    draft_head = m.lm_head.get_draft_head_argmax() if tree is None else None
+    draft_head_topk = m.lm_head.get_draft_head_topk() if tree is not None else None
     old_wire = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     try:
         drafter.reset()
@@ -154,12 +160,16 @@ def stream_dspark(
         accepted_per_round: list[int] = []
         round_ms: list[float] = []
         serial_steps = 0
+        branch_hits = 0
         ewma_accept = 3.0
         serial_cooldown = 0
         serial_burst_len = 8
+        pending_draft: mx.array | None = None
+        pending_block_size: int = cur_block
 
         while emitted_total < max_tokens and anchor not in eos:
             if adaptive and serial_cooldown > 0:
+                pending_draft = None
                 nxt_mx, cache, taps = m.forward_argmax([anchor], cache=cache, tap_visits=tap_ids)
                 nxt_mx = nxt_mx[0, -1]
                 mx.eval(nxt_mx, taps)
@@ -174,31 +184,72 @@ def stream_dspark(
                 continue
 
             tr0 = time.perf_counter()
-            block_size = cur_block
-            # Pipelined zero-sync GPU stream: async_eval(draft) runs drafter while CPU encodes target verify!
-            draft_gpu = drafter.propose_gpu(anchor, m.embed, draft_head, draft_len=block_size)
-            mx.async_eval(draft_gpu)
-            base_pos = cache.seq_len
-            cache.begin_spec_verify()
-            ver_preds_mx, cache, ver_taps = m.forward_all_argmax(draft_gpu, cache=cache, tap_visits=tap_ids)
-            ver_preds_mx = ver_preds_mx[0]
-            mx.eval(draft_gpu, ver_preds_mx, ver_taps)
-
-            draft_block = np.array(draft_gpu, dtype=np.int32).tolist()
-            preds = np.array(ver_preds_mx, dtype=np.int32).tolist()
-
-            k_match = 0
-            for j in range(1, block_size):
-                if preds[j - 1] == draft_block[j]:
-                    k_match += 1
+            if tree_spec is not None:
+                block_size = tree_spec["T"]
+                if pending_draft is not None:
+                    draft_gpu = pending_draft
+                    pending_draft = None
                 else:
-                    break
-            k_commit = k_match + 1
-            cache.commit_spec_verify(k_commit, block_size)
-            drafter.push_context(ver_taps[:k_commit], start_pos=base_pos)
-            mx.async_eval(drafter.f_rnn, *drafter.ctx_k, *drafter.ctx_v)
+                    draft_gpu = drafter.propose_tree8_gpu(anchor, m.embed, draft_head_topk, topology=tree)
+                    mx.async_eval(draft_gpu)
+                base_pos = cache.seq_len
+                cache.begin_spec_verify()
+                ver_preds_mx, cache, ver_taps = m.forward_all_argmax(draft_gpu, cache=cache, tap_visits=tap_ids, tree_spec=tree_spec)
+                ver_preds_mx = ver_preds_mx[0]
+                mx.eval(draft_gpu, ver_preds_mx, ver_taps)
 
-            raw = draft_block[1 : k_match + 1] + [preds[k_match]]
+                draft_block = np.array(draft_gpu, dtype=np.int32).tolist()
+                preds = np.array(ver_preds_mx, dtype=np.int32).tolist()
+
+                accepted_path = [0]
+                children_tbl = tree_spec["children"]
+                cur = 0
+                while True:
+                    want = preds[cur]
+                    nxt_node = -1
+                    for ch in children_tbl[cur]:
+                        if draft_block[ch] == want:
+                            nxt_node = ch
+                            break
+                    if nxt_node < 0:
+                        break
+                    accepted_path.append(nxt_node)
+                    cur = nxt_node
+                is_contiguous = accepted_path == list(range(len(accepted_path)))
+                if not is_contiguous:
+                    branch_hits += 1
+                taps_commit = ver_taps[: len(accepted_path)] if is_contiguous else ver_taps[mx.array(np.array(accepted_path, dtype=np.int32))]
+                raw = [draft_block[n] for n in accepted_path[1:]] + [preds[accepted_path[-1]]]
+                commit_fn = lambda ap=accepted_path, bs=block_size: cache.commit_tree_verify(ap, bs)
+            else:
+                if pending_draft is not None:
+                    draft_gpu = pending_draft
+                    block_size = pending_block_size
+                    pending_draft = None
+                else:
+                    block_size = cur_block
+                    draft_gpu = drafter.propose_gpu(anchor, m.embed, draft_head, draft_len=block_size)
+                    mx.async_eval(draft_gpu)
+                base_pos = cache.seq_len
+                cache.begin_spec_verify()
+                ver_preds_mx, cache, ver_taps = m.forward_all_argmax(draft_gpu, cache=cache, tap_visits=tap_ids)
+                ver_preds_mx = ver_preds_mx[0]
+                mx.eval(draft_gpu, ver_preds_mx, ver_taps)
+
+                draft_block = np.array(draft_gpu, dtype=np.int32).tolist()
+                preds = np.array(ver_preds_mx, dtype=np.int32).tolist()
+
+                k_match = 0
+                for j in range(1, block_size):
+                    if preds[j - 1] == draft_block[j]:
+                        k_match += 1
+                    else:
+                        break
+                k_commit = k_match + 1
+                taps_commit = ver_taps[:k_commit]
+                raw = draft_block[1 : k_match + 1] + [preds[k_match]]
+                commit_fn = lambda kc=k_commit, bs=block_size: cache.commit_spec_verify(kc, bs)
+
             chunk: list[int] = []
             for tok in raw:
                 if emitted_total >= max_tokens:
@@ -208,34 +259,47 @@ def stream_dspark(
                 anchor = tok
                 if tok in eos:
                     break
-            if chunk:
-                yield chunk
 
             accepted_per_round.append(len(raw))
-            round_ms.append((time.perf_counter() - tr0) * 1e3)
             ewma_accept = 0.7 * ewma_accept + 0.3 * len(raw)
             if adaptive:
-                if fixed_block is None:
-                    # Adapt draft block length to MoE active-expert cost vs acceptance rate (~20.4ms T=4, ~22.9ms T=6, ~26.1ms T=8)
-                    if ewma_accept >= 4.0:
-                        cur_block = drafter.block_size
-                    elif ewma_accept >= 2.0:
-                        cur_block = min(6, drafter.block_size)
-                    else:
-                        cur_block = min(4, drafter.block_size)
+                if tree_spec is None and fixed_block is None:
+                    # Adapt between block 6 (best on medium/high-entropy) and block 8 (best on high-acceptance spans)
+                    cur_block = drafter.block_size if ewma_accept >= 3.6 else min(6, drafter.block_size)
                 if len(accepted_per_round) >= 5 and ewma_accept < 1.35:
                     serial_cooldown = serial_burst_len
                     serial_burst_len = min(16, serial_burst_len * 2)
                     ewma_accept = 2.0
+
+            # Zero-bubble GPU pipeline: enqueue drafter context update + NEXT round's proposal BEFORE
+            # `commit_spec_verify` + `yield chunk`, so GPU stays 100% busy while CPU rolls back conv/KV!
+            drafter.push_context(taps_commit, start_pos=base_pos)
+            will_spec_next = (emitted_total < max_tokens) and (anchor not in eos) and not (adaptive and serial_cooldown > 0)
+            if will_spec_next:
+                if tree_spec is not None:
+                    pending_draft = drafter.propose_tree8_gpu(anchor, m.embed, draft_head_topk, topology=tree)
+                    pending_block_size = tree_spec["T"]
+                else:
+                    pending_draft = drafter.propose_gpu(anchor, m.embed, draft_head, draft_len=cur_block)
+                    pending_block_size = cur_block
+                mx.async_eval(pending_draft, drafter.f_rnn, *drafter.ctx_k, *drafter.ctx_v)
+            else:
+                mx.async_eval(drafter.f_rnn, *drafter.ctx_k, *drafter.ctx_v)
+
+            commit_fn()
+            round_ms.append((time.perf_counter() - tr0) * 1e3)
+            if chunk:
+                yield chunk
 
         t3 = time.perf_counter()
         if stats_out is not None:
             decode_s = max(t3 - t2, 1e-9)
             decode_toks = max(emitted_total - 1, 0)
             mean_acc = sum(accepted_per_round) / max(len(accepted_per_round), 1)
+            mode_name = f"dspark_tree_{tree}" if tree is not None else ("dspark_adaptive" if adaptive else "dspark")
             stats_out.update(
                 {
-                    "mode": "dspark_adaptive" if adaptive else "dspark",
+                    "mode": mode_name,
                     "prompt_tokens": len(prompt_ids),
                     "tokens": decode_toks,
                     "generated_tokens": emitted_total,
@@ -245,6 +309,7 @@ def stream_dspark(
                     "decode_tok_s": round(decode_toks / decode_s, 2) if decode_toks else 0.0,
                     "rounds": len(accepted_per_round),
                     "tokens_per_check": round(mean_acc, 2),
+                    "branch_hits": branch_hits,
                     "median_round_ms": round(statistics.median(round_ms), 2) if round_ms else 0.0,
                     "serial_steps": serial_steps,
                     "active_gb": round(mx.get_active_memory() / 1e9, 3),
@@ -280,11 +345,12 @@ def generate_dspark(
     eos_ids: Sequence[int] = (200006,),
     adaptive: bool = True,
     draft_len: int | None = None,
+    tree: str | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     stats: dict[str, Any] = {}
     out: list[int] = []
     for chunk in stream_dspark(
-        model, drafter, prompt_ids, max_tokens=max_tokens, eos_ids=eos_ids, adaptive=adaptive, draft_len=draft_len, stats_out=stats
+        model, drafter, prompt_ids, max_tokens=max_tokens, eos_ids=eos_ids, adaptive=adaptive, draft_len=draft_len, tree=tree, stats_out=stats
     ):
         out.extend(chunk)
     return out, stats

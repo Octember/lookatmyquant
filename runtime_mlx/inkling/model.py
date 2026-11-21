@@ -36,6 +36,7 @@ from .fast_kernels import (
     gqa_relpos_sinks_sdpa_fast,
     kv_dyn_sconv4_norm_fused,
     kv_sconv4_norm_fused,
+    make_tree_spec,
     moe_wsum_sconv4_res_fused,
     msg_blend_norm_3x_fused,
     msg_blend_norm_fused,
@@ -241,9 +242,8 @@ class Inkling2Cache:
         # Generic fallback KV
         self.keys: list[mx.array | None] = [None] * n_slots
         self.values: list[mx.array | None] = [None] * n_slots
-        # Fast pre-allocated FP16 KV
-        self.kv_k_f16: list[mx.array | None] = [None] * n_slots
-        self.kv_v_f16: list[mx.array | None] = [None] * n_slots
+        # Fast pre-allocated unified FP16 KV (`[2, 8, cap, 128]` -> 1 slice update per visit!)
+        self.kv_f16: list[mx.array | None] = [None] * n_slots
         self.kv_len: list[int] = [0] * n_slots
         self.kv_start: list[int] = [0] * n_slots
         self.kv_cap: list[int] = [0] * n_slots
@@ -264,6 +264,17 @@ class Inkling2Cache:
         if self._fast:
             self._spec_base_kv_len = list(self.kv_len)
 
+    def _compact_sliding_slot(self, slot: int, new_len: int):
+        W = self.cfg.sliding_window_size
+        if self.kv_is_sliding[slot] and new_len > W + 256 and self.kv_f16[slot] is not None:
+            shift = new_len - W
+            KV = self.kv_f16[slot]
+            KV_new = mx.zeros((2, 8, self.kv_cap[slot], 128), dtype=mx.float16)
+            KV_new[:, :, :W, :] = KV[:, :, shift:new_len, :]
+            self.kv_f16[slot] = KV_new
+            self.kv_start[slot] += shift
+            self.kv_len[slot] = W
+
     def commit_spec_verify(self, k_accept: int, block_len: int):
         """Roll back KV & conv states after verifying `block_len` tokens and accepting the first `k_accept` (`1..block_len`)."""
         self._spec_recording = False
@@ -274,18 +285,7 @@ class Inkling2Cache:
             if self._fast:
                 new_len = self._spec_base_kv_len[slot] + k_accept
                 self.kv_len[slot] = new_len
-                if self.kv_is_sliding[slot] and new_len > W + 256 and self.kv_k_f16[slot] is not None:
-                    shift = new_len - W
-                    K = self.kv_k_f16[slot]
-                    V = self.kv_v_f16[slot]
-                    K_new = mx.zeros((K.shape[0], self.kv_cap[slot], K.shape[2]), dtype=mx.float16)
-                    V_new = mx.zeros((V.shape[0], self.kv_cap[slot], V.shape[2]), dtype=mx.float16)
-                    K_new[:, :W, :] = K[:, shift:new_len, :]
-                    V_new[:, :W, :] = V[:, shift:new_len, :]
-                    self.kv_k_f16[slot] = K_new
-                    self.kv_v_f16[slot] = V_new
-                    self.kv_start[slot] += shift
-                    self.kv_len[slot] = W
+                self._compact_sliding_slot(slot, new_len)
             else:
                 kv = self._spec_kv_full[slot]
                 if kv is not None:
@@ -316,6 +316,61 @@ class Inkling2Cache:
                     self.conv_states[slot][ci] = cf[:, k_accept : k_accept + need, :]
                     self._spec_conv_full[slot][ci] = None
 
+    def commit_tree_verify(self, accepted_path: list[int], block_len: int):
+        """Commit an arbitrary causal tree path `accepted_path` (starting at node 0) out of `block_len` verified nodes."""
+        k_accept = len(accepted_path)
+        if accepted_path == list(range(k_accept)):
+            self.commit_spec_verify(k_accept, block_len)
+            return
+        self._spec_recording = False
+        self.seq_len = self._spec_base_seq + k_accept
+        idx_mx = mx.array(np.array(accepted_path, dtype=np.int32))
+        idx_last3 = mx.array(np.array(accepted_path[-3:], dtype=np.int32))
+        W = self.cfg.sliding_window_size
+        for slot in range(len(self.keys)):
+            if self._fast:
+                base = self._spec_base_kv_len[slot]
+                KV = self.kv_f16[slot]
+                if KV is not None:
+                    gathered = KV[:, :, base : base + block_len, :][:, :, idx_mx, :]
+                    KV[:, :, base : base + k_accept, :] = gathered
+                new_len = base + k_accept
+                self.kv_len[slot] = new_len
+                self._compact_sliding_slot(slot, new_len)
+            else:
+                kv = self._spec_kv_full[slot]
+                if kv is not None:
+                    K, V, is_sliding = kv
+                    base_k = K.shape[2] - block_len
+                    K = mx.concatenate([K[:, :, :base_k, :], K[:, :, base_k:, :][:, :, idx_mx, :]], axis=2)
+                    V = mx.concatenate([V[:, :, :base_k, :], V[:, :, base_k:, :][:, :, idx_mx, :]], axis=2)
+                    if is_sliding and K.shape[2] > W:
+                        K = K[:, :, -W:, :]
+                        V = V[:, :, -W:, :]
+                    self.keys[slot] = K
+                    self.values[slot] = V
+                    self._spec_kv_full[slot] = None
+
+            for ci in range(4):
+                cp = self._spec_conv_pair[slot][ci]
+                if cp is not None:
+                    prev, x_btc = cp
+                    if k_accept >= 3:
+                        self.conv_states[slot][ci] = x_btc[:, idx_last3, :]
+                    else:
+                        self.conv_states[slot][ci] = mx.concatenate([prev[:, k_accept:, :], x_btc[:, idx_mx, :]], axis=1)
+                    self._spec_conv_pair[slot][ci] = None
+                cf = self._spec_conv_full[slot][ci]
+                if cf is not None:
+                    need = cf.shape[1] - block_len
+                    prev = cf[:, :need, :]
+                    x_btc = cf[:, need:, :]
+                    if k_accept >= need:
+                        self.conv_states[slot][ci] = x_btc[:, mx.array(np.array(accepted_path[-need:], dtype=np.int32)), :]
+                    else:
+                        self.conv_states[slot][ci] = mx.concatenate([prev[:, k_accept:, :], x_btc[:, idx_mx, :]], axis=1)
+                    self._spec_conv_full[slot][ci] = None
+
     def get_conv_prev(self, slot: int, conv_idx: int, C: int) -> mx.array:
         prev = self.conv_states[slot][conv_idx]
         if prev is None:
@@ -327,43 +382,34 @@ class Inkling2Cache:
             self._spec_conv_pair[slot][conv_idx] = (prev, x_btc)
         self.conv_states[slot][conv_idx] = new_prev
 
-    def update_kv_f16(self, slot: int, k_f16: mx.array, v_f16: mx.array, is_sliding: bool) -> tuple[mx.array, mx.array, int, int, int]:
-        """Pre-allocated FP16 KV append. k_f16, v_f16: `[8, T, 128]` float16. Returns `(K, V, kv_len, kv_start, kv_cap)`."""
-        T = int(k_f16.shape[1])
+    def update_kv_f16(self, slot: int, kv_f16: mx.array, is_sliding: bool) -> tuple[mx.array, int, int, int]:
+        """Pre-allocated unified FP16 KV append. `kv_f16`: `[2, 8, T, 128]` float16. Returns `(KV_buf, kv_len, kv_start, kv_cap)`."""
+        T = int(kv_f16.shape[2])
         cur = self.kv_len[slot]
         self.kv_is_sliding[slot] = is_sliding
         W = self.cfg.sliding_window_size
-        # Compact sliding buffer only outside spec verify when past W + 256
         if is_sliding and not self._spec_recording and cur + T > self.kv_cap[slot] and cur > W:
             shift = cur - W
-            K_old, V_old = self.kv_k_f16[slot], self.kv_v_f16[slot]
+            KV_old = self.kv_f16[slot]
             new_cap = max(self.kv_cap[slot], ((W + T + 255) // 256) * 256)
-            K_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
-            V_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
-            K_new[:, :W, :] = K_old[:, shift:cur, :]
-            V_new[:, :W, :] = V_old[:, shift:cur, :]
-            self.kv_k_f16[slot] = K_new
-            self.kv_v_f16[slot] = V_new
+            KV_new = mx.zeros((2, 8, new_cap, 128), dtype=mx.float16)
+            KV_new[:, :, :W, :] = KV_old[:, :, shift:cur, :]
+            self.kv_f16[slot] = KV_new
             self.kv_cap[slot] = new_cap
             self.kv_start[slot] += shift
             cur = W
         need = cur + T
-        if self.kv_k_f16[slot] is None or need > self.kv_cap[slot]:
+        if self.kv_f16[slot] is None or need > self.kv_cap[slot]:
             new_cap = ((need + 255) // 256) * 256
-            K_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
-            V_new = mx.zeros((8, new_cap, 128), dtype=mx.float16)
-            if self.kv_k_f16[slot] is not None and cur > 0:
-                K_new[:, :cur, :] = self.kv_k_f16[slot][:, :cur, :]
-                V_new[:, :cur, :] = self.kv_v_f16[slot][:, :cur, :]
-            self.kv_k_f16[slot] = K_new
-            self.kv_v_f16[slot] = V_new
+            KV_new = mx.zeros((2, 8, new_cap, 128), dtype=mx.float16)
+            if self.kv_f16[slot] is not None and cur > 0:
+                KV_new[:, :, :cur, :] = self.kv_f16[slot][:, :, :cur, :]
+            self.kv_f16[slot] = KV_new
             self.kv_cap[slot] = new_cap
-        K_buf = self.kv_k_f16[slot]
-        V_buf = self.kv_v_f16[slot]
-        K_buf[:, cur:need, :] = k_f16
-        V_buf[:, cur:need, :] = v_f16
+        KV_buf = self.kv_f16[slot]
+        KV_buf[:, :, cur:need, :] = kv_f16
         self.kv_len[slot] = need
-        return K_buf, V_buf, need, self.kv_start[slot], self.kv_cap[slot]
+        return KV_buf, need, self.kv_start[slot], self.kv_cap[slot]
 
     def update_kv(self, slot: int, k: mx.array, v: mx.array, is_sliding: bool) -> tuple[mx.array, mx.array]:
         if self.keys[slot] is None:
@@ -401,11 +447,9 @@ class Inkling2Cache:
     def state(self) -> list[mx.array]:
         out: list[mx.array] = []
         if self._fast:
-            for k, v in zip(self.kv_k_f16, self.kv_v_f16):
-                if k is not None:
-                    out.append(k)
-                if v is not None:
-                    out.append(v)
+            for kv in self.kv_f16:
+                if kv is not None:
+                    out.append(kv)
         else:
             for k, v in zip(self.keys, self.values):
                 if k is not None:
@@ -521,6 +565,7 @@ class PackedMoE:
         cache: Inkling2Cache,
         cache_slot: int,
         T: int,
+        tree_lag: mx.array | None = None,
     ) -> mx.array:
         """Full fast MoE taking pre-rotated `x_rot_gu_f16` + `h_mlp_f16` from fused BAR/MsgBlend+Norm+RHT."""
         logits_f16 = h_mlp_f16 @ self.router_w_f16.T
@@ -541,7 +586,7 @@ class PackedMoE:
 
         prev = cache.get_conv_prev(cache_slot, 3, 2304)
         if T <= 16:
-            out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T)
+            out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag)
             cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
             return out
         mlp_sum = mx.sum(y_dn.reshape(T, 8, 2304) * w_norm.reshape(T, 8, 1), axis=1)
@@ -845,17 +890,10 @@ class PackedLMHead:
         best_ord = mx.argmax(ordered, axis=-1)
         return self.order_mx[best_ord].reshape(B, T)
 
-    def get_draft_head_argmax(self, max_buckets: int = 5, bits: int = 4):
-        """Lazily build a compact MLX 4-bit shortlist head over the top Fisher/frequency buckets (`b0..4` = 32,768 rows, ~38 MB).
-
-        Only used by DSpark's 7-step drafter RNN; the target always verifies against the full 200,058-row packed head.
-        """
-        if not self._fast:
-            return lambda h_1d: self.argmax(h_1d[None, None, :])[0, 0]
+    def _ensure_draft_head(self, max_buckets: int = 5, bits: int = 4):
         key = (max_buckets, bits)
         if key not in self._draft_cache:
             nb = min(max_buckets, self.nb)
-            # Dequantize ONLY the first `nb` buckets (<= 65,536 rows) on GPU, unrotate each bucket into standard basis, quantize to MLX 4-bit!
             W_full = self.stage.dequant_f16()
             wqs, scs, bis = [], [], []
             total_rows = 0
@@ -864,7 +902,6 @@ class PackedLMHead:
                 rows_b = hi - lo
                 total_rows += rows_b
                 Q_b = W_full[lo:hi].astype(mx.float32)  # [rows_b, 2304]
-                # Unrotate: y = (x @ R_b.T) @ Q_b.T = x @ (Q_b @ R_b).T -> W_b = rht_out_2304_fast(Q_b, signs_b)!
                 W_b = rht_out_2304_fast(Q_b, self.stage.signs_in[bi : bi + 1], mx.zeros((rows_b,), dtype=mx.uint32))
                 wq, sc, bi_q = mx.quantize(W_b.astype(mx.float16), group_size=64, bits=bits)
                 mx.eval(wq, sc, bi_q)
@@ -879,8 +916,16 @@ class PackedLMHead:
             mx.eval(wq_all, sc_all, bi_all, order_sub)
             mx.clear_cache()
             self._draft_cache[key] = (wq_all, sc_all, bi_all, order_sub, bits)
+        return self._draft_cache[key]
 
-        wq_all, sc_all, bi_all, order_sub, qbits = self._draft_cache[key]
+    def get_draft_head_argmax(self, max_buckets: int = 5, bits: int = 4):
+        """Lazily build a compact MLX 4-bit shortlist head over the top Fisher/frequency buckets (`b0..4` = 32,768 rows, ~38 MB).
+
+        Only used by DSpark's 7-step drafter RNN; the target always verifies against the full 200,058-row packed head.
+        """
+        if not self._fast:
+            return lambda h_1d: self.argmax(h_1d[None, None, :])[0, 0]
+        wq_all, sc_all, bi_all, order_sub, qbits = self._ensure_draft_head(max_buckets, bits)
 
         def _draft_argmax(h_1d: mx.array) -> mx.array:
             scores = mx.quantized_matmul(
@@ -890,6 +935,37 @@ class PackedLMHead:
             return order_sub[mx.argmax(scores)]
 
         return _draft_argmax
+
+    def get_draft_head_topk(self, max_buckets: int = 5, bits: int = 4):
+        """Batched top-k shortlist scorer sharing the cached 32K MLX 4-bit head. Input `[B, 2304]` or `[2304]`, returns `int32[B, k]`."""
+        if not self._fast:
+            def _fallback_topk(h: mx.array, k: int = 1) -> mx.array:
+                h2 = h.reshape(-1, self.hidden_size)
+                logits = self(h2[None, :, :])[0]
+                if k == 1:
+                    return mx.argmax(logits, axis=-1, keepdims=True).astype(mx.int32)
+                part = mx.argpartition(-logits, k - 1, axis=-1)[:, :k]
+                vals = mx.take_along_axis(logits, part, axis=-1)
+                ord_k = mx.argsort(-vals, axis=-1)
+                return mx.take_along_axis(part, ord_k, axis=-1).astype(mx.int32)
+            return _fallback_topk
+
+        wq_all, sc_all, bi_all, order_sub, qbits = self._ensure_draft_head(max_buckets, bits)
+
+        def _draft_topk(h: mx.array, k: int = 1) -> mx.array:
+            scores = mx.quantized_matmul(
+                h.reshape(-1, 2304).astype(mx.float16), wq_all, sc_all, bi_all,
+                transpose=True, group_size=64, bits=qbits,
+            )  # [B, 32768]
+            if k == 1:
+                return order_sub[mx.argmax(scores, axis=-1, keepdims=True)].astype(mx.int32)
+            part = mx.argpartition(-scores, k - 1, axis=-1)[:, :k]
+            vals = mx.take_along_axis(scores, part, axis=-1)
+            ord_k = mx.argsort(-vals, axis=-1)
+            top_idx = mx.take_along_axis(part, ord_k, axis=-1)
+            return order_sub[top_idx].astype(mx.int32)
+
+        return _draft_topk
 
 
 # ----------------------------------------------------------------------------- Decoder Layer & Full Looped Model
@@ -1196,10 +1272,14 @@ class PackedDecoderLayer:
         cache: Inkling2Cache,
         cache_slot: int,
         messages: mx.array | None = None,
+        tree_spec: dict | None = None,
     ) -> mx.array:
         """Ultra-fast fused Metal path for Inkling-2-Mini (B=1, h shape `[T, 2304]`)."""
         cfg = self.cfg
         block_residual = h
+        tree_lag = tree_spec["lag_mx"] if tree_spec is not None else None
+        tree_depth = tree_spec["depth_mx"] if tree_spec is not None else None
+        tree_mask = tree_spec["mask_mx"] if tree_spec is not None else None
 
         # 1. Attn input AttnRes + optional batched message gates + layernorm + 5-matrix batched RHT-2304
         use_qkv_sg8 = 5 <= T <= 8
@@ -1238,14 +1318,15 @@ class PackedDecoderLayer:
         if self.qkv_out_rots[4] is not None:
             o_gate_raw = rht_apply_out(o_gate_raw, self.qkv_out_rots[4])
 
-        # 3. Fused Q/Rel clip (+log_scale) + K/V conv/norm + FP16 KV append
+        # 3. Fused Q/Rel clip (+log_scale) + K/V conv/norm + unified FP16 KV append
         kp = cache.get_conv_prev(cache_slot, 0, 1024)
         vp = cache.get_conv_prev(cache_slot, 1, 1024)
         if self.is_sliding and not self.has_qkv_out_rot:
-            q, rel_st, k_f16, v_f16, new_kp, new_vp = qkv_rel_prep_sliding_fused(
+            q, rel_st, kv_f16, new_kp, new_vp = qkv_rel_prep_sliding_fused(
                 y_qkv, self.q_scale, self.rel_scale,
                 kp, self.k_conv_w, vp, self.v_conv_w,
                 T, cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
+                tree_lag=tree_lag,
             )
             cache.set_conv_after(cache_slot, 0, kp, y_qkv[:, 3072:4096].reshape(1, T, 1024), new_kp)
             cache.set_conv_after(cache_slot, 1, vp, y_qkv[:, 4096:5120].reshape(1, T, 1024), new_vp)
@@ -1267,24 +1348,26 @@ class PackedDecoderLayer:
                 q_pos0, T, self.is_sliding,
                 cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
                 cfg.log_scaling_alpha, cfg.log_scaling_n_floor,
+                tree_depth=tree_depth,
             )
             if self.is_sliding:
-                k_f16, v_f16, new_kp, new_vp = kv_sconv4_norm_fused(kp, k_raw, self.k_conv_w, vp, v_raw, self.v_conv_w, T, cfg.qk_l2_clip_threshold)
+                kv_f16, new_kp, new_vp = kv_sconv4_norm_fused(kp, k_raw, self.k_conv_w, vp, v_raw, self.v_conv_w, T, cfg.qk_l2_clip_threshold, tree_lag=tree_lag)
             else:
-                k_f16, v_f16, new_kp, new_vp = kv_dyn_sconv4_norm_fused(
+                kv_f16, new_kp, new_vp = kv_dyn_sconv4_norm_fused(
                     kp, k_raw, k_in, self.k_dyn_st, self.k_dyn_pr_f16,
                     vp, v_raw, v_in, self.v_dyn_st, self.v_dyn_pr_f16,
-                    T, cfg.qk_l2_clip_threshold,
+                    T, cfg.qk_l2_clip_threshold, tree_lag=tree_lag,
                 )
             cache.set_conv_after(cache_slot, 0, kp, k_raw.reshape(1, T, 1024), new_kp)
             cache.set_conv_after(cache_slot, 1, vp, v_raw.reshape(1, T, 1024), new_vp)
 
-        K_buf, V_buf, kv_len, kv_start, kv_cap = cache.update_kv_f16(cache_slot, k_f16, v_f16, self.is_sliding)
+        KV_buf, kv_len, kv_start, kv_cap = cache.update_kv_f16(cache_slot, kv_f16, self.is_sliding)
 
         # 4. Fused Sinks + GQA+RelPos Flash-Decoding SDPA (1 launch!)
         attn_out = gqa_relpos_sinks_sdpa_fast(
-            q, K_buf, V_buf, rel_st, self.rel_proj_t_f16, q_in, self.sink_w_f16,
+            q, KV_buf, rel_st, self.rel_proj_t_f16, q_in, self.sink_w_f16,
             T, kv_len, kv_start, q_pos0, kv_cap, self.is_sliding,
+            tree_depth=tree_depth, tree_mask=tree_mask,
         )
 
         # 5. Fused Gate*Attn + RHT-3072 -> O projection -> Post-Attn ShortConv4 (+ Residual)
@@ -1294,12 +1377,12 @@ class PackedDecoderLayer:
             o_out = rht_apply_out(o_out, self.o_out_rot)
         pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
         if self.is_block_boundary:
-            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None)
+            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None, tree_lag=tree_lag)
             residual = h_post
             local_blocks = block_residual[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, block_residual[None, :, :]], axis=0)
             n_local = n_blocks + 1
         else:
-            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=block_residual)
+            h_post, new_pa = short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=block_residual, tree_lag=tree_lag)
             residual = h_post
             local_blocks = blocks_cat
             n_local = n_blocks
@@ -1313,7 +1396,7 @@ class PackedDecoderLayer:
             fg_mg = _msg_1x_compiled(h_m, messages[3], self.mlp_dh, self.mlp_dm, self.mlp_fm)
             h_mlp_f16, x_rot_gu = msg_blend_norm_rht_fast(h_m, messages[3], fg_mg, self.post_attn_ln, self.moe.gu_signs_in)
 
-        return self.moe.forward_fast_fused_prerot(h_mlp_f16, x_rot_gu, residual, self.post_mlp_conv_w, cache, cache_slot, T)
+        return self.moe.forward_fast_fused_prerot(h_mlp_f16, x_rot_gu, residual, self.post_mlp_conv_w, cache, cache_slot, T, tree_lag=tree_lag)
 
     def __call__(
         self,
@@ -1455,6 +1538,7 @@ class Inkling2LoopPackedMLX:
         all_logits: bool = False,
         argmax_only: bool = False,
         tap_visits: tuple[int, ...] = (),
+        tree_spec: dict | None = None,
     ):
         cfg = self.cfg
         h = self.embed(input_ids)[0]  # [T, 2304]
@@ -1471,7 +1555,7 @@ class Inkling2LoopPackedMLX:
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
             if L.is_block_boundary:
                 blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                 n_blocks += 1
@@ -1489,7 +1573,7 @@ class Inkling2LoopPackedMLX:
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
             if L.is_block_boundary:
                 blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                 n_blocks += 1
@@ -1513,7 +1597,7 @@ class Inkling2LoopPackedMLX:
                     captured[visit] = h
                 L = self.layers[i]
                 msgs = block_attn_res_fused(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)  # [4, T, 2304]
-                new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset, messages=msgs)
+                new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset, messages=msgs, tree_spec=tree_spec)
                 if L.is_block_boundary:
                     blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                     n_blocks += 1
@@ -1527,7 +1611,7 @@ class Inkling2LoopPackedMLX:
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None)
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
             if L.is_block_boundary:
                 blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                 n_blocks += 1
@@ -1555,11 +1639,12 @@ class Inkling2LoopPackedMLX:
         all_logits: bool = False,
         argmax_only: bool = False,
         tap_visits: tuple[int, ...] = (),
+        tree_spec: dict | None = None,
     ):
         if cache is None:
             cache = self.make_cache()
         if self._fast:
-            return self._forward_core_fast(input_ids, cache, all_logits=all_logits, argmax_only=argmax_only, tap_visits=tap_visits)
+            return self._forward_core_fast(input_ids, cache, all_logits=all_logits, argmax_only=argmax_only, tap_visits=tap_visits, tree_spec=tree_spec)
         cfg = self.cfg
         h = self.embed(input_ids)
         T = h.shape[1]
@@ -1636,14 +1721,14 @@ class Inkling2LoopPackedMLX:
     def forward(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
         return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=False, tap_visits=tap_visits)
 
-    def forward_all_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
-        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=False, tap_visits=tap_visits)
+    def forward_all_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = (), tree_spec: dict | None = None):
+        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=False, tap_visits=tap_visits, tree_spec=tree_spec)
 
     def forward_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
         return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=True, tap_visits=tap_visits)
 
-    def forward_all_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
-        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=True, tap_visits=tap_visits)
+    def forward_all_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = (), tree_spec: dict | None = None):
+        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=True, tap_visits=tap_visits, tree_spec=tree_spec)
 
 
 class Inkling2MLXModel:

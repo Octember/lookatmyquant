@@ -277,6 +277,18 @@ def test_mini_model_and_runtime_integration() -> None:
         l_spec = np.concatenate([np.array(l_p)[0], np.array(l_blk)[0, :2], np.array(l_8)[0], np.array(l_9)[0]], axis=0)
         assert float(np.max(np.abs(lf - l_spec))) < 5e-3
 
+        # Non-contiguous tree commit_tree_verify test on fallback cache
+        c_tr = model.make_cache()
+        l_tp, c_tr = model.forward_all_logits(toks[:6], cache=c_tr)
+        mx.eval(l_tp)
+        c_tr.begin_spec_verify()
+        # Use valid linear path [0, 1] via contiguous fast-path and non-contiguous [0, 2] shape check
+        l_tblk, c_tr = model.forward_all_logits([toks[6], 0, toks[7], 1], cache=c_tr)
+        mx.eval(l_tblk)
+        c_tr.commit_tree_verify([0, 2], block_len=4)
+        assert c_tr.offset == 8
+        assert all(k is not None and k.shape[2] == 8 for k in c_tr.keys)
+
         # Drafter file resolution test
         ddir = pdir / "drafter"
         ddir.mkdir()
@@ -319,6 +331,60 @@ def test_moe_grouped_large_expert_count_parity() -> None:
             assert err < 2e-3, f"Slot {s} expert {eid} mismatch: {err}"
 
 
+def test_tree_spec_and_kernels() -> None:
+    """Verify causal tree metadata and tree-mode Metal conv + SDPA kernels match linear paths exactly."""
+    from runtime_mlx.inkling.drafter import TREE_TOPOLOGIES
+    from runtime_mlx.inkling.fast_kernels import (
+        gqa_relpos_sinks_sdpa_fast,
+        make_tree_spec,
+        short_conv4_res_fused,
+    )
+
+    for name, parents in TREE_TOPOLOGIES.items():
+        spec = make_tree_spec(parents)
+        assert spec["T"] == 8 and spec["paths"][0] == [0], f"bad spec {name}"
+        assert len(spec["depth"]) == 8 and spec["depth"][0] == 0
+
+    spec = make_tree_spec(TREE_TOPOLOGIES["4-3"])
+    rng = np.random.default_rng(77)
+    prev = mx.array(rng.standard_normal((1, 3, 2304)).astype(np.float32))
+    x = mx.array(rng.standard_normal((8, 2304)).astype(np.float32))
+    w = mx.array(rng.standard_normal((4, 2304)).astype(np.float32))
+    res = mx.array(rng.standard_normal((8, 2304)).astype(np.float32))
+    out_t, _ = short_conv4_res_fused(prev, x, w, 8, 2304, residual=res, tree_lag=spec["lag_mx"])
+    # Check Branch B = [0, 5, 6, 7] against contiguous 4-token linear conv!
+    xb = mx.stack([x[0], x[5], x[6], x[7]], axis=0)
+    rb = mx.stack([res[0], res[5], res[6], res[7]], axis=0)
+    out_b, _ = short_conv4_res_fused(prev, xb, w, 4, 2304, residual=rb)
+    mx.eval(out_t, out_b)
+    for j, ni in enumerate((0, 5, 6, 7)):
+        err = float(np.max(np.abs(np.array(out_t[ni]) - np.array(out_b[j]))))
+        assert err < 1e-5, f"tree short_conv4 mismatch on node {ni}: {err}"
+
+    # Check tree SDPA Branch B = [0, 5, 6, 7] against linear T=4 SDPA
+    q = mx.array(rng.standard_normal((8, 24, 128)).astype(np.float32))
+    rel = mx.array(rng.standard_normal((8, 24, 16)).astype(np.float32))
+    rp = mx.array(rng.standard_normal((1024, 16)).astype(np.float16) * 0.1)
+    qin = mx.array(rng.standard_normal((8, 2304)).astype(np.float32) * 0.1)
+    sw = mx.array(rng.standard_normal((24, 2304)).astype(np.float16) * 0.05)
+    kv_hist = mx.array(rng.standard_normal((2, 8, 12, 128)).astype(np.float16) * 0.2)
+    kv_tree = mx.array(rng.standard_normal((2, 8, 8, 128)).astype(np.float16) * 0.2)
+    KV_t = mx.zeros((2, 8, 32, 128), dtype=mx.float16)
+    KV_t[:, :, :12, :] = kv_hist
+    KV_t[:, :, 12:20, :] = kv_tree
+    ao_t = gqa_relpos_sinks_sdpa_fast(q, KV_t, rel, rp, qin, sw, 8, 20, 0, 12, 32, True, tree_depth=spec["depth_mx"], tree_mask=spec["mask_mx"])
+
+    idx_b = mx.array([0, 5, 6, 7], dtype=mx.int32)
+    KV_b = mx.zeros((2, 8, 32, 128), dtype=mx.float16)
+    KV_b[:, :, :12, :] = kv_hist
+    KV_b[:, :, 12:16, :] = kv_tree[:, :, idx_b, :]
+    ao_b = gqa_relpos_sinks_sdpa_fast(q[idx_b], KV_b, rel[idx_b], rp, qin[idx_b], sw, 4, 16, 0, 12, 32, True)
+    mx.eval(ao_t, ao_b)
+    for j, ni in enumerate((0, 5, 6, 7)):
+        err = float(np.max(np.abs(np.array(ao_t[ni]) - np.array(ao_b[j]))))
+        assert err < 1e-4, f"tree SDPA mismatch on node {ni}: {err}"
+
+
 def test_fast_kernels_suite() -> None:
     """Verify all H=2304 Apple Silicon fast Metal kernels against exact references."""
     from runtime_mlx.inkling.fast_kernels import _selftest
@@ -329,6 +395,7 @@ def test_fast_kernels_suite() -> None:
 def main() -> None:
     test_mini_model_and_runtime_integration()
     test_moe_grouped_large_expert_count_parity()
+    test_tree_spec_and_kernels()
     test_fast_kernels_suite()
     print("ALL INKLING MLX RUNTIME TESTS PASSED!", flush=True)
 

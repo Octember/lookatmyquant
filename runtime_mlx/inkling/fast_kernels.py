@@ -1126,7 +1126,7 @@ class DenseStage:
     def matmul_rotated_f16(self, x_rot_f16: mx.array, T: int) -> mx.array:
         """Execute `x_rot_f16` (shape `[n_mats, T, n]` or `[T, n]` for n_mats==1) -> `float32[T, total_out]`."""
         if T == 1:
-            rps, sg, ntg = 4, 8, 160
+            rps, sg, ntg = (2, 4, 160) if self.total_out <= 3072 else (2, 8, 160)
             kern = _make_dense_stage_kernel(self.n, self.fids, 1, rps=rps, sg=sg)
             mt = _u32(self.total_out, self.n_mats, ntg)
             return kern(
@@ -1137,7 +1137,7 @@ class DenseStage:
                 output_dtypes=[mx.float32],
             )[0]
         if T <= 8:
-            rps, sg, ntg = 1, 16, 80
+            rps, sg, ntg = 1, 8, 160
             kern = _make_dense_stage_kernel(self.n, self.fids, T, rps=rps, sg=sg)
             mt = _u32(self.total_out, self.n_mats, ntg)
             return kern(
@@ -1904,10 +1904,10 @@ def _make_block_attn_res_kernel(with_norm: bool):
         #pragma unroll
         for (uint e = 0; e < 9u; e++) ss += acc[qi][e] * acc[qi][e];
         ss = simd_sum(ss);
-        if (lane == 0u) red[simd] = ss;
+        if (lane == 0u) red[qi][simd] = ss;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float tot = 0.0f;
-        for (uint i = 0; i < 8u; i++) tot += red[i];
+        for (uint i = 0; i < 8u; i++) tot += red[qi][i];
         const float ir_out = metal::precise::rsqrt(tot * (1.0f / 2304.0f) + 1e-6f);
         device float* op = out + ((ulong)qi * T + t) * 2304u;
         #pragma unroll
@@ -1931,7 +1931,7 @@ def _make_block_attn_res_kernel(with_norm: bool):
     const uint n_blocks = meta[0], num_q = meta[1], T = meta[2];
     const uint S = n_blocks + 1u;
 
-    threadgroup float red[8];
+    threadgroup float red[4][8];
     threadgroup float tg_ss[8][8];
     threadgroup float tg_dp[8][4][8];
     threadgroup float tg_w[4][8];
@@ -2018,7 +2018,7 @@ def _make_block_attn_res_kernel(with_norm: bool):
     )
 
 
-_EMPTY_F32 = mx.zeros((1,), dtype=mx.float32)
+_EMPTY_F32 = mx.zeros((2304,), dtype=mx.float32)
 
 
 def block_attn_res_fused(
@@ -2048,6 +2048,55 @@ def block_attn_res_fused(
         output_shapes=[(num_q, T, 2304)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+@lru_cache(maxsize=32)
+def make_tree_spec(parents: tuple[int, ...]) -> dict:
+    """Precompute GPU arrays & traversal tables for an arbitrary causal speculation tree (T <= 8, parents[0] == -1)."""
+    T = len(parents)
+    assert 1 <= T <= 8 and parents[0] == -1
+    depth = [0] * T
+    mask = [0] * T
+    lags = [0] * (T * 4)
+    paths: list[list[int]] = []
+    children: list[list[int]] = [[] for _ in range(T)]
+    for t in range(T):
+        p = parents[t]
+        if t > 0:
+            assert 0 <= p < t
+            depth[t] = depth[p] + 1
+            mask[t] = mask[p] | (1 << t)
+            children[p].append(t)
+            paths.append(paths[p] + [t])
+        else:
+            mask[0] = 1
+            paths.append([0])
+        # 4-tap conv lags [oldest..newest] = [p^3, p^2, p^1, t] (stepping -1 -> -2 -> -3 past root into conv prev[2,1,0])
+        cur = t
+        seq4 = [0, 0, 0, 0]
+        for k in (3, 2, 1, 0):
+            seq4[k] = cur
+            if cur > 0:
+                cur = parents[cur]
+            elif cur == 0:
+                cur = -1
+            else:
+                cur -= 1
+        lags[t * 4 : t * 4 + 4] = seq4
+    lag_mx = mx.array(np.array(lags, dtype=np.int32))
+    depth_mx = mx.array(np.array(depth, dtype=np.uint32))
+    mask_mx = mx.array(np.array(mask, dtype=np.uint32))
+    mx.eval(lag_mx, depth_mx, mask_mx)
+    return {
+        "parents": parents,
+        "T": T,
+        "lag_mx": lag_mx,
+        "depth_mx": depth_mx,
+        "mask_mx": mask_mx,
+        "depth": depth,
+        "paths": paths,
+        "children": children,
+    }
 
 
 @lru_cache(maxsize=2)
@@ -2409,11 +2458,12 @@ def msg_blend_norm_3x_fused(
     )[0]
 
 
-@lru_cache(maxsize=2)
-def _make_q_rel_clip_kernel():
+@lru_cache(maxsize=4)
+def _make_q_rel_clip_kernel(tree_mode: bool = False):
     # Fuses q * q_scale + l2_clip(+log_scale) AND rel * rel_scale + l2_clip(+log_scale) in ONE launch!
-    # grid = (128, 24 * T, 1), threadgroup = (128, 1, 1): 1 threadgroup per (t, head)
-    src = """
+    pos_expr = "(q_pos0 + tree_depth[t])" if tree_mode else "(q_pos0 + t)"
+    in_names = ["q_raw", "q_scale", "rel_raw", "rel_scale", "meta", "cfg"] + (["tree_depth"] if tree_mode else [])
+    src = f"""
     const uint ht = threadgroup_position_in_grid.y;
     const uint t = ht / 24u;
     const uint h = ht - t * 24u;
@@ -2425,10 +2475,10 @@ def _make_q_rel_clip_kernel():
     const float q_thresh = cfg[0], r_thresh = cfg[1], alpha = cfg[2], inv_nfloor = cfg[3];
 
     float tau = 1.0f;
-    if (!is_sliding) {
-        const float ratio = ((float)(q_pos0 + t) + 1.0f) * inv_nfloor;
+    if (!is_sliding) {{
+        const float ratio = ((float){pos_expr} + 1.0f) * inv_nfloor;
         if (ratio > 1.0f) tau = 1.0f + alpha * metal::precise::log(ratio);
-    }
+    }}
 
     // 1. Q [T, 24, 128] (1 thread per dim)
     const ulong q_off = ((ulong)t * 24u + h) * 128u + tid;
@@ -2442,18 +2492,18 @@ def _make_q_rel_clip_kernel():
     q_out[q_off] = qv * q_mul;
 
     // 2. Rel [T, 24, 16] (first 16 lanes of simd 0!)
-    if (tid < 16u) {
+    if (tid < 16u) {{
         const ulong r_off = ((ulong)t * 24u + h) * 16u + tid;
         const float rv = rel_raw[r_off] * rel_scale[h * 16u + tid];
         float rs = rv * rv;
         rs += simd_shuffle_xor(rs, 8u); rs += simd_shuffle_xor(rs, 4u); rs += simd_shuffle_xor(rs, 2u); rs += simd_shuffle_xor(rs, 1u);
         const float r_mul = min(r_thresh / (metal::precise::sqrt(rs) + 1e-6f), 1.0f) * tau;
         rel_out[r_off] = rv * r_mul;
-    }
+    }}
     """
     return mx.fast.metal_kernel(
-        name="ink_q_rel_clip",
-        input_names=["q_raw", "q_scale", "rel_raw", "rel_scale", "meta", "cfg"],
+        name=f"ink_q_rel_clip_tr{int(tree_mode)}",
+        input_names=in_names,
         output_names=["q_out", "rel_out"],
         source=src,
     )
@@ -2471,13 +2521,17 @@ def q_rel_clip_fused(
     rel_thresh: float,
     alpha: float,
     n_floor: int,
+    tree_depth: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
-    return _make_q_rel_clip_kernel()(
-        inputs=[
-            q_raw.reshape(-1), q_scale.reshape(-1), rel_raw.reshape(-1), rel_scale.reshape(-1),
-            _u32(int(is_sliding), q_pos0),
-            _f32_arr(qk_thresh, rel_thresh, alpha, 1.0 / float(n_floor)),
-        ],
+    ins = [
+        q_raw.reshape(-1), q_scale.reshape(-1), rel_raw.reshape(-1), rel_scale.reshape(-1),
+        _u32(int(is_sliding), q_pos0),
+        _f32_arr(qk_thresh, rel_thresh, alpha, 1.0 / float(n_floor)),
+    ]
+    if tree_depth is not None:
+        ins.append(tree_depth)
+    return _make_q_rel_clip_kernel(tree_depth is not None)(
+        inputs=ins,
         grid=(128, 24 * T, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(T, 24, 128), (T, 24, 16)],
@@ -2485,11 +2539,12 @@ def q_rel_clip_fused(
     )
 
 
-@lru_cache(maxsize=2)
-def _make_kv_sconv4_norm_kernel():
-    # Fuses BOTH k and v static 4-tap short_conv + k l2_clip + v unweighted_rms_norm -> float16[8, T, 128] + new conv states!
-    # grid = (128, 8 * T, 1), threadgroup = (128, 1, 1): 1 threadgroup per (t, kv_head)!
-    src = """
+@lru_cache(maxsize=4)
+def _make_kv_sconv4_norm_kernel(tree_mode: bool = False):
+    # Fuses BOTH k and v static 4-tap short_conv + k l2_clip + v unweighted_rms_norm -> unified float16[2, 8, T, 128] + new conv states!
+    lag_expr = "tree_lag[t * 4u + k]" if tree_mode else "((int)t + (int)k - 3)"
+    in_names = ["k_prev", "k_raw", "k_w", "v_prev", "v_raw", "v_w", "meta", "cfg"] + (["tree_lag"] if tree_mode else [])
+    src = f"""
     const uint ht = threadgroup_position_in_grid.y;
     const uint t = ht / 8u;
     const uint h = ht - t * 8u;
@@ -2500,51 +2555,52 @@ def _make_kv_sconv4_norm_kernel():
     const uint ch = h * 128u + d;
     const float k_thresh = cfg[0];
     constexpr float INV_SQRT5 = 0.4472135954999579f;
+    const ulong v_off = (ulong)8u * T * 128u;
 
     // 1. K static 4-tap conv + L2Clip
     float kv = k_raw[(ulong)t * 1024u + ch];
     float k_acc = kv;
-    for (uint k = 0; k < 4u; k++) {
-        const int idx = (int)t + (int)k - 3;
+    for (uint k = 0; k < 4u; k++) {{
+        const int idx = {lag_expr};
         const float v = (idx >= 0) ? k_raw[(ulong)idx * 1024u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
         k_acc += v * k_w[(ulong)k * 1024u + ch];
-    }
+    }}
     k_acc *= INV_SQRT5;
-    threadgroup float red[4];
+    threadgroup float red_k[4], red_v[4];
     float kss = simd_sum(k_acc * k_acc);
-    if (lane == 0u) red[simd] = kss;
+    if (lane == 0u) red_k[simd] = kss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float k_norm = metal::precise::sqrt(red[0] + red[1] + red[2] + red[3]);
-    k_out[((ulong)h * T + t) * 128u + d] = (half)(k_acc * min(k_thresh / (k_norm + 1e-6f), 1.0f));
+    const float k_norm = metal::precise::sqrt(red_k[0] + red_k[1] + red_k[2] + red_k[3]);
+    kv_out[((ulong)h * T + t) * 128u + d] = (half)(k_acc * min(k_thresh / (k_norm + 1e-6f), 1.0f));
 
     // 2. V static 4-tap conv + UnweightedRMSNorm
     float vv = v_raw[(ulong)t * 1024u + ch];
     float v_acc = vv;
-    for (uint k = 0; k < 4u; k++) {
-        const int idx = (int)t + (int)k - 3;
+    for (uint k = 0; k < 4u; k++) {{
+        const int idx = {lag_expr};
         const float v = (idx >= 0) ? v_raw[(ulong)idx * 1024u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
         v_acc += v * v_w[(ulong)k * 1024u + ch];
-    }
+    }}
     v_acc *= INV_SQRT5;
     float vss = simd_sum(v_acc * v_acc);
-    if (lane == 0u) red[simd] = vss;
+    if (lane == 0u) red_v[simd] = vss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float v_ir = metal::precise::rsqrt((red[0] + red[1] + red[2] + red[3]) * (1.0f / 128.0f) + 1e-6f);
-    v_out[((ulong)h * T + t) * 128u + d] = (half)(v_acc * v_ir);
+    const float v_ir = metal::precise::rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3]) * (1.0f / 128.0f) + 1e-6f);
+    kv_out[v_off + ((ulong)h * T + t) * 128u + d] = (half)(v_acc * v_ir);
 
     // 3. Save new 3-step conv states
-    if (t == 0u) {
-        for (uint j = 0; j < 3u; j++) {
+    if (t == 0u) {{
+        for (uint j = 0; j < 3u; j++) {{
             const int idx = (int)T - 3 + (int)j;
             k_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? k_raw[(ulong)idx * 1024u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
             v_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? v_raw[(ulong)idx * 1024u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
-        }
-    }
+        }}
+    }}
     """
     return mx.fast.metal_kernel(
-        name="ink_kv_sconv4_norm",
-        input_names=["k_prev", "k_raw", "k_w", "v_prev", "v_raw", "v_w", "meta", "cfg"],
-        output_names=["k_out", "v_out", "k_new_prev", "v_new_prev"],
+        name=f"ink_kv_sconv4_norm_u2_tr{int(tree_mode)}",
+        input_names=in_names,
+        output_names=["kv_out", "k_new_prev", "v_new_prev"],
         source=src,
     )
 
@@ -2558,30 +2614,35 @@ def kv_sconv4_norm_fused(
     v_w: mx.array,
     T: int,
     qk_thresh: float,
-) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-    return _make_kv_sconv4_norm_kernel()(
-        inputs=[k_prev.reshape(-1), k_raw.reshape(-1), k_w.reshape(-1), v_prev.reshape(-1), v_raw.reshape(-1), v_w.reshape(-1), _u32(T), _f32_arr(qk_thresh)],
+    tree_lag: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    ins = [k_prev.reshape(-1), k_raw.reshape(-1), k_w.reshape(-1), v_prev.reshape(-1), v_raw.reshape(-1), v_w.reshape(-1), _u32(T), _f32_arr(qk_thresh)]
+    if tree_lag is not None:
+        ins.append(tree_lag)
+    return _make_kv_sconv4_norm_kernel(tree_lag is not None)(
+        inputs=ins,
         grid=(128, 8 * T, 1),
         threadgroup=(128, 1, 1),
-        output_shapes=[(8, T, 128), (8, T, 128), (1, 3, 1024), (1, 3, 1024)],
-        output_dtypes=[mx.float16, mx.float16, mx.float32, mx.float32],
+        output_shapes=[(2, 8, T, 128), (1, 3, 1024), (1, 3, 1024)],
+        output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
 
 
-@lru_cache(maxsize=2)
-def _make_qkv_rel_prep_sliding_kernel():
-    # Single launch for ALL 40 sliding visits: Q+Rel clip AND K+V static 4-tap conv + norm reading y_qkv[T, 8576] directly!
-    # grid = (128, 32 * T, 1), threadgroup = (128, 1, 1): [0..24*T) = Q+Rel, [24*T..32*T) = K+V
-    src = """
+@lru_cache(maxsize=4)
+def _make_qkv_rel_prep_sliding_kernel(tree_mode: bool = False):
+    # Single launch for ALL 40 sliding visits: Q+Rel clip AND K+V static 4-tap conv + norm -> unified kv_out[2, 8, T, 128]!
+    lag_expr = "tree_lag[t * 4u + k]" if tree_mode else "((int)t + (int)k - 3)"
+    in_names = ["y_qkv", "q_scale", "rel_scale", "k_prev", "k_w", "v_prev", "v_w", "meta", "cfg"] + (["tree_lag"] if tree_mode else [])
+    src = f"""
     const uint ht = threadgroup_position_in_grid.y;
     const uint tid = thread_position_in_threadgroup.x; // 0..127
     const uint lane = thread_index_in_simdgroup;
     const uint simd = simdgroup_index_in_threadgroup;
     const uint T = meta[0];
     const float qk_thresh = cfg[0], r_thresh = cfg[1];
-    threadgroup float red[4];
+    threadgroup float red[4], red_v[4];
 
-    if (ht < 24u * T) {
+    if (ht < 24u * T) {{
         const uint t = ht / 24u;
         const uint h = ht - t * 24u;
         const device float* row = y_qkv + (ulong)t * 8576u;
@@ -2592,60 +2653,61 @@ def _make_qkv_rel_prep_sliding_kernel():
         const float q_norm = metal::precise::sqrt(red[0] + red[1] + red[2] + red[3]);
         q_out[((ulong)t * 24u + h) * 128u + tid] = qv * min(qk_thresh / (q_norm + 1e-6f), 1.0f);
 
-        if (tid < 16u) {
+        if (tid < 16u) {{
             const float rv = row[5120u + h * 16u + tid] * rel_scale[h * 16u + tid];
             float rs = rv * rv;
             rs += simd_shuffle_xor(rs, 8u); rs += simd_shuffle_xor(rs, 4u); rs += simd_shuffle_xor(rs, 2u); rs += simd_shuffle_xor(rs, 1u);
             rel_out[((ulong)t * 24u + h) * 16u + tid] = rv * min(r_thresh / (metal::precise::sqrt(rs) + 1e-6f), 1.0f);
-        }
-    } else {
+        }}
+    }} else {{
         const uint ht2 = ht - 24u * T;
         const uint t = ht2 / 8u;
         const uint h = ht2 - t * 8u;
         const uint ch = h * 128u + tid;
         constexpr float INV_SQRT5 = 0.4472135954999579f;
+        const ulong v_off = (ulong)8u * T * 128u;
 
         // K static 4-tap conv + L2Clip (k_raw sits at +3072 in y_qkv[t, 8576])
         float k_acc = y_qkv[(ulong)t * 8576u + 3072u + ch];
-        for (uint k = 0; k < 4u; k++) {
-            const int idx = (int)t + (int)k - 3;
+        for (uint k = 0; k < 4u; k++) {{
+            const int idx = {lag_expr};
             const float v = (idx >= 0) ? y_qkv[(ulong)idx * 8576u + 3072u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
             k_acc += v * k_w[(ulong)k * 1024u + ch];
-        }
+        }}
         k_acc *= INV_SQRT5;
         float kss = simd_sum(k_acc * k_acc);
         if (lane == 0u) red[simd] = kss;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float k_norm = metal::precise::sqrt(red[0] + red[1] + red[2] + red[3]);
-        k_out[((ulong)h * T + t) * 128u + tid] = (half)(k_acc * min(qk_thresh / (k_norm + 1e-6f), 1.0f));
+        kv_out[((ulong)h * T + t) * 128u + tid] = (half)(k_acc * min(qk_thresh / (k_norm + 1e-6f), 1.0f));
 
         // V static 4-tap conv + UnweightedRMSNorm (v_raw sits at +4096 in y_qkv[t, 8576])
         float v_acc = y_qkv[(ulong)t * 8576u + 4096u + ch];
-        for (uint k = 0; k < 4u; k++) {
-            const int idx = (int)t + (int)k - 3;
+        for (uint k = 0; k < 4u; k++) {{
+            const int idx = {lag_expr};
             const float v = (idx >= 0) ? y_qkv[(ulong)idx * 8576u + 4096u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
             v_acc += v * v_w[(ulong)k * 1024u + ch];
-        }
+        }}
         v_acc *= INV_SQRT5;
         float vss = simd_sum(v_acc * v_acc);
-        if (lane == 0u) red[simd] = vss;
+        if (lane == 0u) red_v[simd] = vss;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float v_ir = metal::precise::rsqrt((red[0] + red[1] + red[2] + red[3]) * (1.0f / 128.0f) + 1e-6f);
-        v_out[((ulong)h * T + t) * 128u + tid] = (half)(v_acc * v_ir);
+        const float v_ir = metal::precise::rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3]) * (1.0f / 128.0f) + 1e-6f);
+        kv_out[v_off + ((ulong)h * T + t) * 128u + tid] = (half)(v_acc * v_ir);
 
-        if (t == 0u) {
-            for (uint j = 0; j < 3u; j++) {
+        if (t == 0u) {{
+            for (uint j = 0; j < 3u; j++) {{
                 const int idx = (int)T - 3 + (int)j;
                 k_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? y_qkv[(ulong)idx * 8576u + 3072u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
                 v_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? y_qkv[(ulong)idx * 8576u + 4096u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
-            }
-        }
-    }
+            }}
+        }}
+    }}
     """
     return mx.fast.metal_kernel(
-        name="ink_qkv_rel_prep_sliding",
-        input_names=["y_qkv", "q_scale", "rel_scale", "k_prev", "k_w", "v_prev", "v_w", "meta", "cfg"],
-        output_names=["q_out", "rel_out", "k_out", "v_out", "k_new_prev", "v_new_prev"],
+        name=f"ink_qkv_rel_prep_sl_u2_tr{int(tree_mode)}",
+        input_names=in_names,
+        output_names=["q_out", "rel_out", "kv_out", "k_new_prev", "v_new_prev"],
         source=src,
     )
 
@@ -2661,25 +2723,30 @@ def qkv_rel_prep_sliding_fused(
     T: int,
     qk_thresh: float,
     rel_thresh: float,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
-    return _make_qkv_rel_prep_sliding_kernel()(
-        inputs=[
-            y_qkv.reshape(-1), q_scale.reshape(-1), rel_scale.reshape(-1),
-            k_prev.reshape(-1), k_w.reshape(-1), v_prev.reshape(-1), v_w.reshape(-1),
-            _u32(T), _f32_arr(qk_thresh, rel_thresh),
-        ],
+    tree_lag: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+    ins = [
+        y_qkv.reshape(-1), q_scale.reshape(-1), rel_scale.reshape(-1),
+        k_prev.reshape(-1), k_w.reshape(-1), v_prev.reshape(-1), v_w.reshape(-1),
+        _u32(T), _f32_arr(qk_thresh, rel_thresh),
+    ]
+    if tree_lag is not None:
+        ins.append(tree_lag)
+    return _make_qkv_rel_prep_sliding_kernel(tree_lag is not None)(
+        inputs=ins,
         grid=(128, 32 * T, 1),
         threadgroup=(128, 1, 1),
-        output_shapes=[(T, 24, 128), (T, 24, 16), (8, T, 128), (8, T, 128), (1, 3, 1024), (1, 3, 1024)],
-        output_dtypes=[mx.float32, mx.float32, mx.float16, mx.float16, mx.float32, mx.float32],
+        output_shapes=[(T, 24, 128), (T, 24, 16), (2, 8, T, 128), (1, 3, 1024), (1, 3, 1024)],
+        output_dtypes=[mx.float32, mx.float32, mx.float16, mx.float32, mx.float32],
     )
 
 
-@lru_cache(maxsize=2)
-def _make_kv_dyn_sconv4_norm_kernel():
-    # Single launch for ALL 8 global visits: dynamic weight proj + 4-tap conv + K L2Clip + V RMSNorm + FP16 transpose + new_prev!
-    # grid = (128, 8 * T, 1), threadgroup = (128, 1, 1): 1 threadgroup per (t, kv_head)!
-    src = """
+@lru_cache(maxsize=4)
+def _make_kv_dyn_sconv4_norm_kernel(tree_mode: bool = False):
+    # Single launch for ALL 8 global visits: dynamic weight proj + 4-tap conv + K L2Clip + V RMSNorm -> unified kv_out[2, 8, T, 128]!
+    lag_expr = "tree_lag[t * 4u + (3u - lag)]" if tree_mode else "((int)t - (int)lag)"
+    in_names = ["k_prev", "k_raw", "k_in", "k_st", "k_pr", "v_prev", "v_raw", "v_in", "v_st", "v_pr", "meta", "cfg"] + (["tree_lag"] if tree_mode else [])
+    src = f"""
     const uint ht = threadgroup_position_in_grid.y;
     const uint t = ht / 8u;
     const uint h = ht - t * 8u;
@@ -2690,86 +2757,87 @@ def _make_kv_dyn_sconv4_norm_kernel():
     const uint ch = h * 128u + d;
     const float k_thresh = cfg[0];
     constexpr float INV_3 = 0.3333333333333333f;
+    const ulong v_off = (ulong)8u * T * 128u;
 
     // 1. Compute 4 dynamic tap weights for K and 4 for V via dot(in[t], proj[h*4 + lag])
     const device float2* kin2 = (const device float2*)(k_in + (ulong)t * 2304u);
     const device float2* vin2 = (const device float2*)(v_in + (ulong)t * 2304u);
     float2 ki_reg[9], vi_reg[9];
     #pragma unroll
-    for (uint i = 0; i < 9u; i++) {
+    for (uint i = 0; i < 9u; i++) {{
         const uint idx = d + i * 128u;
         ki_reg[i] = kin2[idx];
         vi_reg[i] = vin2[idx];
-    }
+    }}
     threadgroup float tg_dk[4][4], tg_dv[4][4];
     #pragma unroll
-    for (uint lag = 0; lag < 4u; lag++) {
+    for (uint lag = 0; lag < 4u; lag++) {{
         const device half2* kpw = (const device half2*)(k_pr + (ulong)(h * 4u + lag) * 2304u);
         const device half2* vpw = (const device half2*)(v_pr + (ulong)(h * 4u + lag) * 2304u);
         float kd = 0.0f, vd = 0.0f;
         #pragma unroll
-        for (uint i = 0; i < 9u; i++) {
+        for (uint i = 0; i < 9u; i++) {{
             const uint idx = d + i * 128u;
             kd += dot(ki_reg[i], float2(kpw[idx]));
             vd += dot(vi_reg[i], float2(vpw[idx]));
-        }
+        }}
         kd = simd_sum(kd);
         vd = simd_sum(vd);
-        if (lane == 0u) { tg_dk[lag][simd] = kd; tg_dv[lag][simd] = vd; }
-    }
+        if (lane == 0u) {{ tg_dk[lag][simd] = kd; tg_dv[lag][simd] = vd; }}
+    }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float dk[4], dv[4];
     #pragma unroll
-    for (uint lag = 0; lag < 4u; lag++) {
+    for (uint lag = 0; lag < 4u; lag++) {{
         dk[lag] = tg_dk[lag][0] + tg_dk[lag][1] + tg_dk[lag][2] + tg_dk[lag][3];
         dv[lag] = tg_dv[lag][0] + tg_dv[lag][1] + tg_dv[lag][2] + tg_dv[lag][3];
-    }
+    }}
 
     // 2. K dynamic 4-tap conv (lag 0 = newest t, lag 3 = oldest t-3) + L2Clip
     float k_acc = k_raw[(ulong)t * 1024u + ch];
     #pragma unroll
-    for (uint lag = 0; lag < 4u; lag++) {
-        const int idx = (int)t - (int)lag;
+    for (uint lag = 0; lag < 4u; lag++) {{
+        const int idx = {lag_expr};
         const float v = (idx >= 0) ? k_raw[(ulong)idx * 1024u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
         k_acc += v * (k_st[(ulong)lag * 1024u + ch] + dk[lag]);
-    }
+    }}
     k_acc *= INV_3;
-    threadgroup float red[4];
+    threadgroup float red_k[4], red_v[4];
     float kss = simd_sum(k_acc * k_acc);
-    if (lane == 0u) red[simd] = kss;
+    if (lane == 0u) red_k[simd] = kss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float k_norm = metal::precise::sqrt(red[0] + red[1] + red[2] + red[3]);
-    k_out[((ulong)h * T + t) * 128u + d] = (half)(k_acc * min(k_thresh / (k_norm + 1e-6f), 1.0f));
+    const float k_norm = metal::precise::sqrt(red_k[0] + red_k[1] + red_k[2] + red_k[3]);
+    kv_out[((ulong)h * T + t) * 128u + d] = (half)(k_acc * min(k_thresh / (k_norm + 1e-6f), 1.0f));
 
     // 3. V dynamic 4-tap conv + UnweightedRMSNorm
     float v_acc = v_raw[(ulong)t * 1024u + ch];
     #pragma unroll
-    for (uint lag = 0; lag < 4u; lag++) {
-        const int idx = (int)t - (int)lag;
+    for (uint lag = 0; lag < 4u; lag++) {{
+        const int idx = {lag_expr};
         const float v = (idx >= 0) ? v_raw[(ulong)idx * 1024u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
         v_acc += v * (v_st[(ulong)lag * 1024u + ch] + dv[lag]);
-    }
+    }}
     v_acc *= INV_3;
     float vss = simd_sum(v_acc * v_acc);
-    if (lane == 0u) red[simd] = vss;
+    if (lane == 0u) red_v[simd] = vss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float v_ir = metal::precise::rsqrt((red[0] + red[1] + red[2] + red[3]) * (1.0f / 128.0f) + 1e-6f);
-    v_out[((ulong)h * T + t) * 128u + d] = (half)(v_acc * v_ir);
+    const float v_ir = metal::precise::rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3]) * (1.0f / 128.0f) + 1e-6f);
+    kv_out[v_off + ((ulong)h * T + t) * 128u + d] = (half)(v_acc * v_ir);
 
     // 4. Save new 3-step conv states
-    if (t == 0u) {
-        for (uint j = 0; j < 3u; j++) {
+    if (t == 0u) {{
+        for (uint j = 0; j < 3u; j++) {{
             const int idx = (int)T - 3 + (int)j;
             k_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? k_raw[(ulong)idx * 1024u + ch] : k_prev[(ulong)(idx + 3) * 1024u + ch];
             v_new_prev[(ulong)j * 1024u + ch] = (idx >= 0) ? v_raw[(ulong)idx * 1024u + ch] : v_prev[(ulong)(idx + 3) * 1024u + ch];
-        }
-    }
+        }}
+    }}
     """
     return mx.fast.metal_kernel(
-        name="ink_kv_dyn_sconv4_norm",
-        input_names=["k_prev", "k_raw", "k_in", "k_st", "k_pr", "v_prev", "v_raw", "v_in", "v_st", "v_pr", "meta", "cfg"],
-        output_names=["k_out", "v_out", "k_new_prev", "v_new_prev"],
+        name=f"ink_kv_dyn_sconv4_u2_tr{int(tree_mode)}",
+        input_names=in_names,
+        output_names=["kv_out", "k_new_prev", "v_new_prev"],
         source=src,
     )
 
@@ -2787,24 +2855,47 @@ def kv_dyn_sconv4_norm_fused(
     v_pr_f16: mx.array,
     T: int,
     qk_thresh: float,
-) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-    return _make_kv_dyn_sconv4_norm_kernel()(
-        inputs=[
-            k_prev.reshape(-1), k_raw.reshape(-1), k_in.reshape(-1), k_st.reshape(-1), k_pr_f16.reshape(-1),
-            v_prev.reshape(-1), v_raw.reshape(-1), v_in.reshape(-1), v_st.reshape(-1), v_pr_f16.reshape(-1),
-            _u32(T), _f32_arr(qk_thresh),
-        ],
+    tree_lag: mx.array | None = None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    ins = [
+        k_prev.reshape(-1), k_raw.reshape(-1), k_in.reshape(-1), k_st.reshape(-1), k_pr_f16.reshape(-1),
+        v_prev.reshape(-1), v_raw.reshape(-1), v_in.reshape(-1), v_st.reshape(-1), v_pr_f16.reshape(-1),
+        _u32(T), _f32_arr(qk_thresh),
+    ]
+    if tree_lag is not None:
+        ins.append(tree_lag)
+    return _make_kv_dyn_sconv4_norm_kernel(tree_lag is not None)(
+        inputs=ins,
         grid=(128, 8 * T, 1),
         threadgroup=(128, 1, 1),
-        output_shapes=[(8, T, 128), (8, T, 128), (1, 3, 1024), (1, 3, 1024)],
-        output_dtypes=[mx.float16, mx.float16, mx.float32, mx.float32],
+        output_shapes=[(2, 8, T, 128), (1, 3, 1024), (1, 3, 1024)],
+        output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
 
 
-@lru_cache(maxsize=2)
-def _make_gqa_relpos_sdpa_kernel():
-    # Fuses sink_proj (dot(q_in[t], sink_w[h])) directly inside SDPA threadgroup -> ZERO extra barriers or launches!
-    src = """
+@lru_cache(maxsize=4)
+def _make_gqa_relpos_sdpa_kernel(tree_mode: bool = False):
+    # Fuses sink_proj directly inside SDPA threadgroup; reads unified KV[2, 8, kv_cap, 128] + optional tree mask/depth!
+    in_names = ["q", "KV", "rel_st", "rel_proj_t", "q_in", "sink_w", "meta"] + (["tree_depth", "tree_mask"] if tree_mode else [])
+    if tree_mode:
+        qpos_decl = "const uint q_pos = meta[3] + tree_depth[t]; const uint kv_base = kv_len - T; const uint my_mask = tree_mask[t];"
+        jhi_decl = "const uint j_hi = kv_len;"
+        dist_block = """
+        uint dist;
+        if (j >= kv_base) {
+            const uint u = j - kv_base;
+            if (((my_mask >> u) & 1u) == 0u) continue;
+            dist = tree_depth[t] - tree_depth[u];
+        } else {
+            dist = q_pos - (kv_start + j);
+        }
+        """
+    else:
+        qpos_decl = "const uint q_pos = meta[3] + t;"
+        jhi_decl = "const uint j_hi = min(kv_len, (q_pos >= kv_start) ? (q_pos - kv_start + 1u) : 0u);"
+        dist_block = "const uint dist = q_pos - (kv_start + j);"
+
+    src = f"""
     const uint ht = threadgroup_position_in_grid.y;
     const uint t = ht / 24u;
     const uint h = ht - t * 24u;
@@ -2816,7 +2907,7 @@ def _make_gqa_relpos_sdpa_kernel():
     const uint T = meta[0];
     const uint kv_len = meta[1];
     const uint kv_start = meta[2];
-    const uint q_pos = meta[3] + t;
+    {qpos_decl}
     const uint kv_cap = meta[4];
     const uint is_sliding = meta[5];
 
@@ -2825,10 +2916,10 @@ def _make_gqa_relpos_sdpa_kernel():
     const device half2* sw2 = (const device half2*)(sink_w + (ulong)h * 2304u);
     float sk_part = 0.0f;
     #pragma unroll
-    for (uint i = 0; i < 9u; i++) {
+    for (uint i = 0; i < 9u; i++) {{
         const uint idx = tid + i * 128u;
         sk_part += dot(qin2[idx], float2(sw2[idx]));
-    }
+    }}
     sk_part = simd_sum(sk_part);
 
     const device float4* qp = (const device float4*)(q + ((ulong)t * 24u + h) * 128u);
@@ -2837,25 +2928,25 @@ def _make_gqa_relpos_sdpa_kernel():
     const device float4* rsp = (const device float4*)(rel_st + ((ulong)t * 24u + h) * 16u);
     const float4 rs0 = rsp[0], rs1 = rsp[1], rs2 = rsp[2], rs3 = rsp[3];
 
-    const device half* Kp = K + (ulong)kvh * kv_cap * 128u;
-    const device half* Vp = V + (ulong)kvh * kv_cap * 128u;
+    const device half* Kp = KV + (ulong)kvh * kv_cap * 128u;
+    const device half* Vp = KV + (ulong)(8u + kvh) * kv_cap * 128u;
 
     const int min_pos = is_sliding ? ((int)q_pos - 1023) : 0;
     const uint j_lo = (min_pos > (int)kv_start) ? (uint)(min_pos - (int)kv_start) : 0u;
-    const uint j_hi = min(kv_len, (q_pos >= kv_start) ? (q_pos - kv_start + 1u) : 0u);
+    {jhi_decl}
 
     float m_loc = -1e30f;
     float l_loc = 0.0f;
     float4 acc = float4(0.0f);
 
-    for (uint j = j_lo + simd; j < j_hi; j += 4u) {
+    for (uint j = j_lo + simd; j < j_hi; j += 4u) {{
+        {dist_block}
         const device half4* kp = (const device half4*)(Kp + (ulong)j * 128u);
         float score = simd_sum(dot(qv, float4(kp[lane])));
-        const uint dist = q_pos - (kv_start + j);
-        if (dist < 1024u) {
+        if (dist < 1024u) {{
             const device half4* rp = (const device half4*)(rel_proj_t + (ulong)dist * 16u);
             score += dot(rs0, float4(rp[0])) + dot(rs1, float4(rp[1])) + dot(rs2, float4(rp[2])) + dot(rs3, float4(rp[3]));
-        }
+        }}
         const float m_new = max(m_loc, score);
         const float alpha = metal::precise::exp(m_loc - m_new);
         const float p = metal::precise::exp(score - m_new);
@@ -2863,32 +2954,32 @@ def _make_gqa_relpos_sdpa_kernel():
         const device half4* vp = (const device half4*)(Vp + (ulong)j * 128u);
         acc = acc * alpha + p * float4(vp[lane]);
         m_loc = m_new;
-    }
+    }}
 
     threadgroup float tg_m[4], tg_l[4], tg_sk[4];
     threadgroup float4 tg_a[4][32];
-    if (lane == 0u) { tg_m[simd] = m_loc; tg_l[simd] = l_loc; tg_sk[simd] = sk_part; }
+    if (lane == 0u) {{ tg_m[simd] = m_loc; tg_l[simd] = l_loc; tg_sk[simd] = sk_part; }}
     tg_a[simd][lane] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (simd == 0u) {
+    if (simd == 0u) {{
         const float sk = tg_sk[0] + tg_sk[1] + tg_sk[2] + tg_sk[3];
         float m_all = sk;
         for (uint s = 0; s < 4u; s++) m_all = max(m_all, tg_m[s]);
         float l_all = metal::precise::exp(sk - m_all);
         float4 a_all = float4(0.0f);
-        for (uint s = 0; s < 4u; s++) {
+        for (uint s = 0; s < 4u; s++) {{
             const float scale = metal::precise::exp(tg_m[s] - m_all);
             l_all += tg_l[s] * scale;
             a_all += tg_a[s][lane] * scale;
-        }
+        }}
         device float4* op = (device float4*)(out + ((ulong)t * 24u + h) * 128u);
         op[lane] = a_all * (1.0f / l_all);
-    }
+    }}
     """
     return mx.fast.metal_kernel(
-        name="ink_gqa_relpos_sdpa_sinks_v2",
-        input_names=["q", "K", "V", "rel_st", "rel_proj_t", "q_in", "sink_w", "meta"],
+        name=f"ink_gqa_relpos_sdpa_u2_tr{int(tree_mode)}",
+        input_names=in_names,
         output_names=["out"],
         source=src,
     )
@@ -2896,8 +2987,7 @@ def _make_gqa_relpos_sdpa_kernel():
 
 def gqa_relpos_sinks_sdpa_fast(
     q: mx.array,
-    K_buf: mx.array,
-    V_buf: mx.array,
+    KV_buf: mx.array,
     rel_st: mx.array,
     rel_proj_t_f16: mx.array,
     q_in: mx.array,
@@ -2908,14 +2998,20 @@ def gqa_relpos_sinks_sdpa_fast(
     q_pos0: int,
     kv_cap: int,
     is_sliding: bool,
+    tree_depth: mx.array | None = None,
+    tree_mask: mx.array | None = None,
 ) -> mx.array:
-    return _make_gqa_relpos_sdpa_kernel()(
-        inputs=[
-            q.reshape(-1), K_buf.reshape(-1), V_buf.reshape(-1),
-            rel_st.reshape(-1), rel_proj_t_f16.reshape(-1),
-            q_in.reshape(-1), sink_w_f16.reshape(-1),
-            _u32(T, kv_len, kv_start, q_pos0, kv_cap, int(is_sliding)),
-        ],
+    tree_mode = tree_depth is not None and tree_mask is not None
+    ins = [
+        q.reshape(-1), KV_buf.reshape(-1),
+        rel_st.reshape(-1), rel_proj_t_f16.reshape(-1),
+        q_in.reshape(-1), sink_w_f16.reshape(-1),
+        _u32(T, kv_len, kv_start, q_pos0, kv_cap, int(is_sliding)),
+    ]
+    if tree_mode:
+        ins.extend([tree_depth, tree_mask])
+    return _make_gqa_relpos_sdpa_kernel(tree_mode)(
+        inputs=ins,
         grid=(128, 24 * T, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(T, 3072)],
@@ -2923,10 +3019,11 @@ def gqa_relpos_sinks_sdpa_fast(
     )[0]
 
 
-@lru_cache(maxsize=4)
-def _make_short_conv4_res_kernel(with_res: bool):
-    in_names = ["prev", "x", "w", "res", "meta"] if with_res else ["prev", "x", "w", "meta"]
+@lru_cache(maxsize=8)
+def _make_short_conv4_res_kernel(with_res: bool, tree_mode: bool = False):
+    in_names = (["prev", "x", "w", "res", "meta"] if with_res else ["prev", "x", "w", "meta"]) + (["tree_lag"] if tree_mode else [])
     add_res = " + res[(ulong)t * C + c]" if with_res else ""
+    lag_expr = "tree_lag[t * 4u + k]" if tree_mode else "((int)t + (int)k - 3)"
     src = f"""
     const uint c = thread_position_in_grid.x;
     const uint t = thread_position_in_grid.y;
@@ -2934,7 +3031,7 @@ def _make_short_conv4_res_kernel(with_res: bool):
     if (c >= C) return;
     float acc = x[(ulong)t * C + c];
     for (uint k = 0; k < 4u; k++) {{
-        const int idx = (int)t + (int)k - 3;
+        const int idx = {lag_expr};
         const float v = (idx >= 0) ? x[(ulong)idx * C + c] : prev[(ulong)(idx + 3) * C + c];
         acc += v * w[(ulong)k * C + c];
     }}
@@ -2947,7 +3044,7 @@ def _make_short_conv4_res_kernel(with_res: bool):
     }}
     """
     return mx.fast.metal_kernel(
-        name=f"ink_sconv4_r{int(with_res)}",
+        name=f"ink_sconv4_r{int(with_res)}_tr{int(tree_mode)}",
         input_names=in_names,
         output_names=["out", "new_prev"],
         source=src,
@@ -2961,19 +3058,27 @@ def short_conv4_res_fused(
     T: int,
     C: int,
     residual: mx.array | None = None,
+    tree_lag: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     gx = ((C + 255) // 256) * 256
     mt = _u32(C, T)
+    tree_mode = tree_lag is not None
     if residual is not None:
-        return _make_short_conv4_res_kernel(True)(
-            inputs=[prev.reshape(-1), x.reshape(-1), w.reshape(-1), residual.reshape(-1), mt],
+        ins = [prev.reshape(-1), x.reshape(-1), w.reshape(-1), residual.reshape(-1), mt]
+        if tree_mode:
+            ins.append(tree_lag)
+        return _make_short_conv4_res_kernel(True, tree_mode)(
+            inputs=ins,
             grid=(gx, T, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(T, C), (1, 3, C)],
             output_dtypes=[mx.float32, mx.float32],
         )
-    return _make_short_conv4_res_kernel(False)(
-        inputs=[prev.reshape(-1), x.reshape(-1), w.reshape(-1), mt],
+    ins = [prev.reshape(-1), x.reshape(-1), w.reshape(-1), mt]
+    if tree_mode:
+        ins.append(tree_lag)
+    return _make_short_conv4_res_kernel(False, tree_mode)(
+        inputs=ins,
         grid=(gx, T, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(T, C), (1, 3, C)],
@@ -2981,39 +3086,66 @@ def short_conv4_res_fused(
     )
 
 
-@lru_cache(maxsize=2)
-def _make_moe_wsum_sconv4_res_kernel():
+@lru_cache(maxsize=4)
+def _make_moe_wsum_sconv4_res_kernel(tree_mode: bool = False):
     # Fuses: mlp[t, c] = sum_{k=0..7} y_dn[(t*8+k)*2304 + c] * w_norm[t*8+k] -> short_conv4 -> + residual!
-    # Works for ANY T (each thread processes channel c across t=0..T-1 sequentially for conv taps, or T<=8 in registers)!
-    src = """
-    // grid = (2304, 1, 1) for T<=16 (or per channel), wait: for T<=8, 2304 threads = 9 threadgroups of 256 -> only 9 TGs!
-    // Better: grid = (2304, T, 1) -> each thread computes wsum for its needed window [t-3..t] (max 4 sums for small T)!
-    // Even simpler: compute wsum for t in [0..T) in one pass when T<=16: split 2304 into 36 TGs of 64 threads -> 36 TGs!
-    const uint c = thread_position_in_grid.x;
-    const uint T = meta[0];
-    if (c >= 2304u) return;
-    float p0 = prev[c], p1 = prev[2304u + c], p2 = prev[4608u + c];
-    const float w0 = conv_w[c], w1 = conv_w[2304u + c], w2 = conv_w[4608u + c], w3 = conv_w[6912u + c];
-    constexpr float INV_SQRT5 = 0.4472135954999579f;
-    for (uint t = 0; t < T; t++) {
-        const ulong base_slot = (ulong)t * 8u;
-        float s = 0.0f;
-        #pragma unroll
-        for (uint k = 0; k < 8u; k++) {
-            s += y_dn[(base_slot + k) * 2304u + c] * w_norm[base_slot + k];
+    if tree_mode:
+        src = """
+        const uint c = thread_position_in_grid.x;
+        const uint T = meta[0];
+        if (c >= 2304u) return;
+        float hist[11];
+        hist[0] = prev[c]; hist[1] = prev[2304u + c]; hist[2] = prev[4608u + c];
+        const float w0 = conv_w[c], w1 = conv_w[2304u + c], w2 = conv_w[4608u + c], w3 = conv_w[6912u + c];
+        constexpr float INV_SQRT5 = 0.4472135954999579f;
+        for (uint t = 0; t < T; t++) {
+            const ulong base_slot = (ulong)t * 8u;
+            float s = 0.0f;
+            #pragma unroll
+            for (uint k = 0; k < 8u; k++) {
+                s += y_dn[(base_slot + k) * 2304u + c] * w_norm[base_slot + k];
+            }
+            hist[3u + t] = s;
+            const float v0 = hist[tree_lag[t * 4u + 0u] + 3];
+            const float v1 = hist[tree_lag[t * 4u + 1u] + 3];
+            const float v2 = hist[tree_lag[t * 4u + 2u] + 3];
+            const float conv_out = (v0 * w0 + v1 * w1 + v2 * w2 + s * w3 + s) * INV_SQRT5;
+            raw_out[(ulong)t * 2304u + c] = s;
+            out[(ulong)t * 2304u + c] = residual[(ulong)t * 2304u + c] + conv_out;
         }
-        const float conv_out = (p0 * w0 + p1 * w1 + p2 * w2 + s * w3 + s) * INV_SQRT5;
-        raw_out[(ulong)t * 2304u + c] = s;
-        out[(ulong)t * 2304u + c] = residual[(ulong)t * 2304u + c] + conv_out;
-        p0 = p1; p1 = p2; p2 = s;
-    }
-    new_prev[c] = p0;
-    new_prev[2304u + c] = p1;
-    new_prev[4608u + c] = p2;
-    """
+        new_prev[c] = hist[T];
+        new_prev[2304u + c] = hist[T + 1u];
+        new_prev[4608u + c] = hist[T + 2u];
+        """
+        in_names = ["y_dn", "w_norm", "prev", "conv_w", "residual", "meta", "tree_lag"]
+    else:
+        src = """
+        const uint c = thread_position_in_grid.x;
+        const uint T = meta[0];
+        if (c >= 2304u) return;
+        float p0 = prev[c], p1 = prev[2304u + c], p2 = prev[4608u + c];
+        const float w0 = conv_w[c], w1 = conv_w[2304u + c], w2 = conv_w[4608u + c], w3 = conv_w[6912u + c];
+        constexpr float INV_SQRT5 = 0.4472135954999579f;
+        for (uint t = 0; t < T; t++) {
+            const ulong base_slot = (ulong)t * 8u;
+            float s = 0.0f;
+            #pragma unroll
+            for (uint k = 0; k < 8u; k++) {
+                s += y_dn[(base_slot + k) * 2304u + c] * w_norm[base_slot + k];
+            }
+            const float conv_out = (p0 * w0 + p1 * w1 + p2 * w2 + s * w3 + s) * INV_SQRT5;
+            raw_out[(ulong)t * 2304u + c] = s;
+            out[(ulong)t * 2304u + c] = residual[(ulong)t * 2304u + c] + conv_out;
+            p0 = p1; p1 = p2; p2 = s;
+        }
+        new_prev[c] = p0;
+        new_prev[2304u + c] = p1;
+        new_prev[4608u + c] = p2;
+        """
+        in_names = ["y_dn", "w_norm", "prev", "conv_w", "residual", "meta"]
     return mx.fast.metal_kernel(
-        name="ink_moe_wsum_sconv4_res",
-        input_names=["y_dn", "w_norm", "prev", "conv_w", "residual", "meta"],
+        name=f"ink_moe_wsum_sconv4_res_tr{int(tree_mode)}",
+        input_names=in_names,
         output_names=["out", "new_prev", "raw_out"],
         source=src,
     )
@@ -3026,10 +3158,14 @@ def moe_wsum_sconv4_res_fused(
     conv_w: mx.array,
     residual: mx.array,
     T: int,
+    tree_lag: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     # For T <= 16, 36 threadgroups of 64 threads handle all 2304 channels in 1 launch!
-    return _make_moe_wsum_sconv4_res_kernel()(
-        inputs=[y_dn.reshape(-1), w_norm.reshape(-1), prev.reshape(-1), conv_w.reshape(-1), residual.reshape(-1), _u32(T)],
+    ins = [y_dn.reshape(-1), w_norm.reshape(-1), prev.reshape(-1), conv_w.reshape(-1), residual.reshape(-1), _u32(T)]
+    if tree_lag is not None:
+        ins.append(tree_lag)
+    return _make_moe_wsum_sconv4_res_kernel(tree_lag is not None)(
+        inputs=ins,
         grid=(2304, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(T, 2304), (1, 3, 2304), (1, T, 2304)],
@@ -3301,7 +3437,8 @@ def _selftest():
     v_st = mx.array(rng.standard_normal((4, 1024)).astype(np.float32))
     k_pr = mx.array(rng.standard_normal((32, 2304)).astype(np.float32))
     v_pr = mx.array(rng.standard_normal((32, 2304)).astype(np.float32))
-    kf, vf, knp, vnp = kv_dyn_sconv4_norm_fused(k_prev, k_raw, k_in, k_st, k_pr.astype(mx.float16), v_prev, v_raw, v_in, v_st, v_pr.astype(mx.float16), T, 22.6274)
+    kvf, knp, vnp = kv_dyn_sconv4_norm_fused(k_prev, k_raw, k_in, k_st, k_pr.astype(mx.float16), v_prev, v_raw, v_in, v_st, v_pr.astype(mx.float16), T, 22.6274)
+    kf, vf = kvf[0], kvf[1]
     # Reference
     k_ctx = mx.concatenate([k_prev, k_raw[None, :, :]], axis=1)
     v_ctx = mx.concatenate([v_prev, v_raw[None, :, :]], axis=1)
@@ -3316,7 +3453,7 @@ def _selftest():
     ek = float(mx.linalg.norm(kf.astype(mx.float32) - k_ref) / mx.linalg.norm(k_ref))
     ev_err = float(mx.linalg.norm(vf.astype(mx.float32) - v_ref) / mx.linalg.norm(v_ref))
     assert ek < 2e-3 and ev_err < 2e-3, f"kv_dyn_sconv4_norm fail: ek={ek}, ev={ev_err}"
-    print(f"  PASS kv_dyn_sconv4_norm_fused: rel_err_k={ek:.2e}, rel_err_v={ev_err:.2e}")
+    print(f"  PASS kv_dyn_sconv4_norm_fused (unified KV): rel_err_k={ek:.2e}, rel_err_v={ev_err:.2e}")
 
     print("ALL fast_kernels selftests PASSED!", flush=True)
 

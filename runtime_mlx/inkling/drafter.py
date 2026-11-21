@@ -71,11 +71,21 @@ def _mix_rmsnorm_compiled(targets: mx.array, alpha: mx.array, weight: mx.array) 
 
 @mx.compile
 def _rnn_update_compiled(state: mx.array, proj: mx.array) -> tuple[mx.array, mx.array]:
-    gate_raw, cand_raw, out_raw = mx.split(proj, 3, axis=0)
+    gate_raw, cand_raw, out_raw = mx.split(proj, 3, axis=-1)
     gate = mx.sigmoid(gate_raw)
     new_state = gate * state + (1.0 - gate) * mx.tanh(cand_raw)
     latent = mx.tanh(out_raw)
     return new_state, latent
+
+
+TREE_TOPOLOGIES: dict[str, tuple[int, ...]] = {
+    "4-3": (-1, 0, 1, 2, 3, 0, 5, 6),       # depth-4 A + depth-3 B (4 head calls)
+    "5-2": (-1, 0, 1, 2, 3, 4, 0, 6),       # depth-5 A + depth-2 B (5 head calls)
+    "4-2-1": (-1, 0, 1, 2, 3, 0, 5, 0),     # depth-4 A + depth-2 B + depth-1 C (4 head calls)
+    "6-1": (-1, 0, 1, 2, 3, 4, 5, 0),       # depth-6 A + depth-1 B (6 head calls)
+    "5-1-1": (-1, 0, 1, 2, 3, 4, 0, 0),     # depth-5 A + top-2 & top-3 at depth 1 (5 head calls)
+    "4-2-2a": (-1, 0, 1, 2, 3, 1, 5, 0),    # depth-4 A + depth-2 alt branch at a1 + depth-1 B (4 head calls)
+}
 
 
 @mx.compile
@@ -309,6 +319,18 @@ class DSparkDrafterMLX:
 
         return rms_norm(h, self.final_norm, self.eps)
 
+    def _markov_step(self, state: mx.array, prev_tok: mx.array, h_s: mx.array) -> tuple[mx.array, mx.array]:
+        """Batched DSpark Markov RNN step: `state [B, 256]`, `prev_tok [B]` -> `(new_state [B, 256], h_pred [B, 2304])`."""
+        B = int(prev_tok.shape[0])
+        prev_emb = self.markov_w1(prev_tok)  # [B, 256]
+        h_b = mx.broadcast_to(h_s[None, :], (B, self.hidden_size))
+        f_b = mx.broadcast_to(self.f_rnn[None, :], (B, self.hidden_size))
+        inp = mx.concatenate([state, prev_emb, h_b, f_b], axis=-1)
+        proj = self.rnn_proj_w(inp) + self.rnn_proj_b[None, :]
+        new_state, latent = _rnn_update_compiled(state, proj)
+        delta_h = self.hidden_out_w(latent) + self.hidden_out_b[None, :]
+        return new_state, h_b + delta_h
+
     def propose_gpu(self, anchor_tok: int | mx.array, embed_fn, head_argmax_fn, draft_len: int | None = None) -> mx.array:
         """Zero-sync GPU block proposal returning `int32[draft_len]` (`[anchor, d1, ..., d_{draft_len-1}]`)."""
         n_toks = self.block_size if draft_len is None else max(2, min(int(draft_len), self.block_size))
@@ -329,6 +351,91 @@ class DSparkDrafterMLX:
             toks.append(nxt)
             prev_tok = nxt
         return mx.concatenate(toks, axis=0)
+
+    def propose_tree8_gpu(
+        self,
+        anchor_tok: int | mx.array,
+        embed_fn,
+        head_topk_fn,
+        topology: str = "4-3",
+    ) -> mx.array:
+        """Zero-sync GPU 8-node DSpark tree proposal (4–6 batched `draft_head` calls, matching `TREE_TOPOLOGIES[topology]`)."""
+        if topology not in TREE_TOPOLOGIES:
+            raise ValueError(f"Unknown tree topology {topology!r}; expected one of {tuple(TREE_TOPOLOGIES)}")
+        anc_mx = anchor_tok.reshape(1).astype(mx.int32) if isinstance(anchor_tok, mx.array) else mx.array([int(anchor_tok)], dtype=mx.int32)
+        anc_emb = embed_fn(anc_mx)[0, 0, :]
+        h = self._run_3layers(anc_emb)
+        z0 = self._zero_state[None, :]  # [1, 256]
+
+        if topology == "4-3":
+            st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+            top2 = head_topk_fn(hp1, 2)[0]  # [2] = [a1, b1]
+            st2, hp2 = self._markov_step(mx.concatenate([st1, st1], axis=0), top2, h[2])
+            t2 = head_topk_fn(hp2, 1)[:, 0]  # [2] = [a2, b2]
+            st3, hp3 = self._markov_step(st2, t2, h[3])
+            t3 = head_topk_fn(hp3, 1)[:, 0]  # [2] = [a3, b3]
+            _, hp4 = self._markov_step(st3[:1], t3[:1], h[4])
+            a4 = head_topk_fn(hp4, 1)[0, :1]
+            return mx.concatenate([anc_mx, top2[:1], t2[:1], t3[:1], a4, top2[1:2], t2[1:2], t3[1:2]], axis=0)
+
+        if topology == "5-2":
+            st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+            top2 = head_topk_fn(hp1, 2)[0]  # [a1, b1]
+            st2, hp2 = self._markov_step(mx.concatenate([st1, st1], axis=0), top2, h[2])
+            t2 = head_topk_fn(hp2, 1)[:, 0]  # [a2, b2]
+            st3, hp3 = self._markov_step(st2[:1], t2[:1], h[3])
+            a3 = head_topk_fn(hp3, 1)[0, :1]
+            st4, hp4 = self._markov_step(st3, a3, h[4])
+            a4 = head_topk_fn(hp4, 1)[0, :1]
+            _, hp5 = self._markov_step(st4, a4, h[5])
+            a5 = head_topk_fn(hp5, 1)[0, :1]
+            return mx.concatenate([anc_mx, top2[:1], t2[:1], a3, a4, a5, top2[1:2], t2[1:2]], axis=0)
+
+        if topology == "4-2-1":
+            st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+            top3 = head_topk_fn(hp1, 3)[0]  # [a1, b1, c1]
+            st2, hp2 = self._markov_step(mx.concatenate([st1, st1], axis=0), top3[:2], h[2])
+            t2 = head_topk_fn(hp2, 1)[:, 0]  # [a2, b2]
+            st3, hp3 = self._markov_step(st2[:1], t2[:1], h[3])
+            a3 = head_topk_fn(hp3, 1)[0, :1]
+            _, hp4 = self._markov_step(st3, a3, h[4])
+            a4 = head_topk_fn(hp4, 1)[0, :1]
+            return mx.concatenate([anc_mx, top3[:1], t2[:1], a3, a4, top3[1:2], t2[1:2], top3[2:3]], axis=0)
+
+        if topology == "6-1":
+            st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+            top2 = head_topk_fn(hp1, 2)[0]  # [a1, b1]
+            cur_st, cur_tok = st1, top2[:1]
+            toks = [anc_mx, top2[:1]]
+            for s in range(2, 7):
+                cur_st, hp = self._markov_step(cur_st, cur_tok, h[s])
+                cur_tok = head_topk_fn(hp, 1)[0, :1]
+                toks.append(cur_tok)
+            toks.append(top2[1:2])
+            return mx.concatenate(toks, axis=0)
+
+        if topology == "5-1-1":
+            st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+            top3 = head_topk_fn(hp1, 3)[0]  # [a1, b1, c1]
+            cur_st, cur_tok = st1, top3[:1]
+            toks = [anc_mx, top3[:1]]
+            for s in range(2, 6):
+                cur_st, hp = self._markov_step(cur_st, cur_tok, h[s])
+                cur_tok = head_topk_fn(hp, 1)[0, :1]
+                toks.append(cur_tok)
+            toks.extend([top3[1:2], top3[2:3]])
+            return mx.concatenate(toks, axis=0)
+
+        # "4-2-2a": (-1, 0, 1, 2, 3, 1, 5, 0) -> [anc, a1, a2, a3, a4, a2_alt, a3_alt, b1]
+        st1, hp1 = self._markov_step(z0, anc_mx, h[1])
+        top2_d1 = head_topk_fn(hp1, 2)[0]  # [a1, b1]
+        st2, hp2 = self._markov_step(st1, top2_d1[:1], h[2])
+        top2_d2 = head_topk_fn(hp2, 2)[0]  # [a2, a2_alt]
+        st3, hp3 = self._markov_step(mx.concatenate([st2, st2], axis=0), top2_d2, h[3])
+        t3 = head_topk_fn(hp3, 1)[:, 0]  # [a3, a3_alt]
+        _, hp4 = self._markov_step(st3[:1], t3[:1], h[4])
+        a4 = head_topk_fn(hp4, 1)[0, :1]
+        return mx.concatenate([anc_mx, top2_d1[:1], top2_d2[:1], t3[:1], a4, top2_d2[1:2], t3[1:2], top2_d1[1:2]], axis=0)
 
     def propose(self, anchor_tok: int, embed_fn, lm_head_fn) -> list[int]:
         """Propose a block of `block_size` tokens `[anchor_tok, d1, ..., d7]`."""
