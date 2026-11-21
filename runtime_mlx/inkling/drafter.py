@@ -352,6 +352,50 @@ class DSparkDrafterMLX:
             prev_tok = nxt
         return mx.concatenate(toks, axis=0)
 
+    def propose_sample_gpu(
+        self,
+        anchor_tok: int | mx.array,
+        embed_fn,
+        head_sample_fn,
+        draft_len: int | None = None,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Zero-sync stochastic GPU block proposal for exact speculative sampling (`temp > 0`).
+
+        Calls `head_sample_fn(h_1d) -> (vocab_tok_i32, ord_tok_i32, probs_q_f32[S])` at each Markov RNN step
+        and returns `(draft_ids: int32[n_toks], draft_ord: int32[n_toks - 1], q_probs: float32[n_toks - 1, S])`.
+        """
+        n_toks = self.block_size if draft_len is None else max(2, min(int(draft_len), self.block_size))
+        anc_mx = (
+            anchor_tok.reshape(1).astype(mx.int32)
+            if isinstance(anchor_tok, mx.array)
+            else mx.array([int(anchor_tok)], dtype=mx.int32)
+        )
+        anc_emb = embed_fn(anc_mx)[0, 0, :]
+        h = self._run_3layers(anc_emb)
+
+        state = self._zero_state
+        prev_tok = anc_mx
+        toks = [anc_mx]
+        ords: list[mx.array] = []
+        probs: list[mx.array] = []
+        for s in range(1, n_toks):
+            prev_emb = self.markov_w1(prev_tok)[0]
+            inp = mx.concatenate([state, prev_emb, h[s], self.f_rnn], axis=0)[None, :]
+            proj = (self.rnn_proj_w(inp) + self.rnn_proj_b)[0]
+            state, latent = _rnn_update_compiled(state, proj)
+            delta_h = self.hidden_out_w(latent[None, :])[0] + self.hidden_out_b
+            vocab_tok, ord_tok, q_prob = head_sample_fn(h[s] + delta_h)
+            nxt = vocab_tok.reshape(1).astype(mx.int32)
+            toks.append(nxt)
+            ords.append(ord_tok.reshape(1).astype(mx.int32))
+            probs.append(q_prob.astype(mx.float32))
+            prev_tok = nxt
+        return (
+            mx.concatenate(toks, axis=0),
+            mx.concatenate(ords, axis=0),
+            mx.stack(probs, axis=0),
+        )
+
     def propose_tree8_gpu(
         self,
         anchor_tok: int | mx.array,

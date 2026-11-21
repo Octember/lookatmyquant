@@ -45,6 +45,7 @@ from .fast_kernels import (
     qkv_rel_prep_sliding_fused,
     rht_in_2304_fast,
     rht_in_3072_gated_fast,
+    rht_out_1024_fast,
     rht_out_2304_fast,
     short_conv4_res_fused,
     sigmoid_top8_norm_and_plan_fast,
@@ -105,6 +106,10 @@ class Inkling2Config:
     loop_end: int = 18
     loop_passes: int = 3
     loop_gate_rank: int = 64
+    moe_k_max: int = 8
+    moe_k_min: int = 8
+    moe_ratio_thr: float = 0.0
+    moe_renorm: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> "Inkling2Config":
@@ -201,8 +206,42 @@ def _softcap_compiled(x: mx.array, cap: mx.array) -> mx.array:
     return mx.tanh(x / cap) * cap
 
 
-def softcap(x: mx.array, cap: float) -> mx.array:
-    return _softcap_compiled(x, _f32(cap))
+def softcap(x: mx.array, cap: float | None) -> mx.array:
+    if cap is None or cap <= 0:
+        return x
+    return _softcap_compiled(x, _f32(float(cap)))
+
+
+def logits_to_probs(logits: mx.array, *, temp: float, top_p: float = 1.0, top_k: int = 0) -> mx.array:
+    """Convert softcapped logits `[..., V]` -> exact normalized `float32[..., V]` probabilities on GPU."""
+    squeeze = logits.ndim == 1
+    x = logits[None, :] if squeeze else logits
+    V = int(x.shape[-1])
+    scaled = x.astype(mx.float32) * (1.0 / float(temp))
+
+    if 0 < top_k < V:
+        k_idx = mx.argpartition(-scaled, top_k - 1, axis=-1)[:, :top_k]
+        k_vals = mx.take_along_axis(scaled, k_idx, axis=-1)
+        if 0.0 < top_p < 1.0:
+            ord_k = mx.argsort(-k_vals, axis=-1)
+            sv = mx.take_along_axis(k_vals, ord_k, axis=-1)
+            si = mx.take_along_axis(k_idx, ord_k, axis=-1)
+            sp = mx.softmax(sv, axis=-1)
+            sp = mx.where((mx.cumsum(sp, axis=-1) - sp) < top_p, sp, 0.0)
+            sp = sp / mx.maximum(mx.sum(sp, axis=-1, keepdims=True), 1e-20)
+            probs = mx.put_along_axis(mx.zeros_like(scaled), si, sp, axis=-1)
+        else:
+            probs = mx.put_along_axis(mx.zeros_like(scaled), k_idx, mx.softmax(k_vals, axis=-1), axis=-1)
+        return probs[0] if squeeze else probs
+
+    probs = mx.softmax(scaled, axis=-1)
+    if 0.0 < top_p < 1.0:
+        sorted_idx = mx.argsort(-probs, axis=-1)
+        sorted_p = mx.take_along_axis(probs, sorted_idx, axis=-1)
+        kept_p = mx.where((mx.cumsum(sorted_p, axis=-1) - sorted_p) < top_p, sorted_p, 0.0)
+        kept_p = kept_p / mx.maximum(mx.sum(kept_p, axis=-1, keepdims=True), 1e-20)
+        probs = mx.put_along_axis(mx.zeros_like(probs), sorted_idx, kept_p, axis=-1)
+    return probs[0] if squeeze else probs
 
 
 @mx.compile
@@ -569,29 +608,46 @@ class PackedMoE:
     ) -> mx.array:
         """Full fast MoE taking pre-rotated `x_rot_gu_f16` + `h_mlp_f16` from fused BAR/MsgBlend+Norm+RHT."""
         logits_f16 = h_mlp_f16 @ self.router_w_f16.T
+        dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
         if 2 <= T <= 8:
-            eids_flat, w_norm, gu_plan, dn_plan = sigmoid_top8_norm_and_plan_fast(
-                logits_f16, self.router_bias, self.cfg.route_scale,
-                self.gu_unified.exp_fid, self.gu_unified.fids,
-                self.dn_unified.exp_fid, self.dn_unified.fids,
-            )
+            if dyn:
+                eids_flat, w_norm, gu_plan, dn_plan = sigmoid_top8_norm_and_plan_fast(
+                    logits_f16, self.router_bias, self.cfg.route_scale,
+                    self.gu_unified.exp_fid, self.gu_unified.fids,
+                    self.dn_unified.exp_fid, self.dn_unified.fids,
+                    k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                    ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                )
+            else:
+                eids_flat, w_norm, gu_plan, dn_plan = sigmoid_top8_norm_and_plan_fast(
+                    logits_f16, self.router_bias, self.cfg.route_scale,
+                    self.gu_unified.exp_fid, self.gu_unified.fids,
+                    self.dn_unified.exp_fid, self.dn_unified.fids,
+                )
             sc = None
         else:
-            eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
+            if dyn:
+                eids_flat, w_norm = sigmoid_top8_norm_fast(
+                    logits_f16, self.router_bias, self.cfg.route_scale,
+                    k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                    ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                )
+            else:
+                eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
             gu_plan = dn_plan = None
             sc = compute_moe_sorted_offsets(eids_flat) if T > 8 else None
-        y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan)
-        act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
-        y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan)
+        if dyn:
+            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan, dynamic_routing=True)
+            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, eids_flat=eids_flat)
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, dynamic_routing=True)
+        else:
+            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan)
+            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan)
 
         prev = cache.get_conv_prev(cache_slot, 3, 2304)
-        if T <= 16:
-            out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag)
-            cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
-            return out
-        mlp_sum = mx.sum(y_dn.reshape(T, 8, 2304) * w_norm.reshape(T, 8, 1), axis=1)
-        out, new_prev = short_conv4_res_fused(prev, mlp_sum, post_mlp_conv_w, T, 2304, residual=residual)
-        cache.set_conv_after(cache_slot, 3, prev, mlp_sum.reshape(1, T, 2304), new_prev)
+        out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn)
+        cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
         return out
 
     def forward_fast_fused(
@@ -883,6 +939,11 @@ class PackedLMHead:
         logits = ordered[:, self.inv_order]
         return softcap(logits, self.cap).reshape(B, T, -1)
 
+    def ordered_logits(self, h: mx.array) -> mx.array:
+        """Raw pre-softcap logits `[B, T, V]` in bucket-ordered layout (`col o <-> order_mx[o]`), skipping 200K `inv_order` gather."""
+        B, T, H = h.shape
+        return self._ordered_logits(h.reshape(B * T, H)).reshape(B, T, -1)
+
     def argmax(self, h: mx.array) -> mx.array:
         """Exact greedy argmax skipping `inv_order` permutation and monotonic `softcap`. Returns `int32[B, T]`."""
         B, T, H = h.shape
@@ -966,6 +1027,45 @@ class PackedLMHead:
             return order_sub[top_idx].astype(mx.int32)
 
         return _draft_topk
+
+    def get_draft_head_sampler(
+        self,
+        temp: float,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        max_buckets: int = 5,
+        bits: int = 4,
+    ):
+        """Stochastic draft shortlist sampler sharing the cached 32K MLX 4-bit head.
+
+        Returns `_draft_sample(h_1d) -> (vocab_tok_i32, ord_tok_i32, probs_q_f32[S])`, aligned 1-to-1 with `ordered_logits[:, :S]`.
+        """
+        cap = self.cap
+        if not self._fast:
+            order_mx = self.order_mx
+
+            def _draft_sample_full(h_1d: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+                raw = self._ordered_logits(h_1d.reshape(1, self.hidden_size))[0]
+                probs_q = logits_to_probs(softcap(raw, cap), temp=temp, top_p=top_p, top_k=top_k)
+                logp = mx.where(probs_q > 0.0, mx.log(mx.maximum(probs_q, 1e-38)), -float("inf"))
+                ord_tok = mx.random.categorical(logp).astype(mx.int32)
+                return order_mx[ord_tok].astype(mx.int32), ord_tok, probs_q
+
+            return _draft_sample_full
+
+        wq_all, sc_all, bi_all, order_sub, qbits = self._ensure_draft_head(max_buckets, bits)
+
+        def _draft_sample(h_1d: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+            raw = mx.quantized_matmul(
+                h_1d.reshape(1, 2304).astype(mx.float16), wq_all, sc_all, bi_all,
+                transpose=True, group_size=64, bits=qbits,
+            )[0]
+            probs_q = logits_to_probs(softcap(raw.astype(mx.float32), cap), temp=temp, top_p=top_p, top_k=top_k)
+            logp = mx.where(probs_q > 0.0, mx.log(mx.maximum(probs_q, 1e-38)), -float("inf"))
+            ord_tok = mx.random.categorical(logp).astype(mx.int32)
+            return order_sub[ord_tok].astype(mx.int32), ord_tok, probs_q
+
+        return _draft_sample
 
 
 # ----------------------------------------------------------------------------- Decoder Layer & Full Looped Model
@@ -1273,6 +1373,8 @@ class PackedDecoderLayer:
         cache_slot: int,
         messages: mx.array | None = None,
         tree_spec: dict | None = None,
+        qkv_w_cached: mx.array | None = None,
+        o_w_cached: mx.array | None = None,
     ) -> mx.array:
         """Ultra-fast fused Metal path for Inkling-2-Mini (B=1, h shape `[T, 2304]`)."""
         cfg = self.cfg
@@ -1313,8 +1415,17 @@ class PackedDecoderLayer:
             x_rot5 = rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
 
         # 2. Fused 5-matrix QKV + Rel + O_Gate stage (1 launch!)
-        y_qkv = self.qkv_stage.matmul_rotated_sg8_f16(x_rot5, T=T, rb=1, sg=8, ntg=160) if use_qkv_sg8 else self.qkv_stage.matmul_rotated_f16(x_rot5, T)  # [T, 8576]
-        o_gate_raw = y_qkv[:, 5504:8576]
+        use_split_parts = (T > 8) and not (self.is_sliding and not self.has_qkv_out_rot)
+        if use_split_parts:
+            q_raw, k_raw, v_raw, rel_raw, o_gate_raw = self.qkv_stage.matmul_rotated_f16_parts(x_rot5, T, W_cached=qkv_w_cached)
+            y_qkv = None
+        else:
+            y_qkv = (
+                self.qkv_stage.matmul_rotated_sg8_f16(x_rot5, T=T, rb=1, sg=8, ntg=160)
+                if use_qkv_sg8
+                else self.qkv_stage.matmul_rotated_f16(x_rot5, T, W_cached=qkv_w_cached)
+            )  # [T, 8576]
+            o_gate_raw = y_qkv[:, 5504:8576]
         if self.qkv_out_rots[4] is not None:
             o_gate_raw = rht_apply_out(o_gate_raw, self.qkv_out_rots[4])
 
@@ -1331,16 +1442,17 @@ class PackedDecoderLayer:
             cache.set_conv_after(cache_slot, 0, kp, y_qkv[:, 3072:4096].reshape(1, T, 1024), new_kp)
             cache.set_conv_after(cache_slot, 1, vp, y_qkv[:, 4096:5120].reshape(1, T, 1024), new_vp)
         else:
-            q_raw = y_qkv[:, 0:3072]
-            k_raw = y_qkv[:, 3072:4096]
-            v_raw = y_qkv[:, 4096:5120]
-            rel_raw = y_qkv[:, 5120:5504]
+            if not use_split_parts:
+                q_raw = y_qkv[:, 0:3072]
+                k_raw = y_qkv[:, 3072:4096]
+                v_raw = y_qkv[:, 4096:5120]
+                rel_raw = y_qkv[:, 5120:5504]
             if self.qkv_out_rots[0] is not None:
                 q_raw = rht_apply_out(q_raw, self.qkv_out_rots[0])
             if self.qkv_out_rots[1] is not None:
-                k_raw = rht_apply_out(k_raw, self.qkv_out_rots[1])
+                k_raw = rht_out_1024_fast(k_raw, self.qkv_out_rots[1]) if k_raw.shape[-1] == 1024 else rht_apply_out(k_raw, self.qkv_out_rots[1])
             if self.qkv_out_rots[2] is not None:
-                v_raw = rht_apply_out(v_raw, self.qkv_out_rots[2])
+                v_raw = rht_out_1024_fast(v_raw, self.qkv_out_rots[2]) if v_raw.shape[-1] == 1024 else rht_apply_out(v_raw, self.qkv_out_rots[2])
             if self.qkv_out_rots[3] is not None:
                 rel_raw = rht_apply_out(rel_raw, self.qkv_out_rots[3])
             q, rel_st = q_rel_clip_fused(
@@ -1363,7 +1475,7 @@ class PackedDecoderLayer:
 
         KV_buf, kv_len, kv_start, kv_cap = cache.update_kv_f16(cache_slot, kv_f16, self.is_sliding)
 
-        # 4. Fused Sinks + GQA+RelPos Flash-Decoding SDPA (1 launch!)
+        # 4. Fused Sinks + GQA+RelPos Flash-Decoding / FlashAttention-2 SDPA (1 launch!)
         attn_out = gqa_relpos_sinks_sdpa_fast(
             q, KV_buf, rel_st, self.rel_proj_t_f16, q_in, self.sink_w_f16,
             T, kv_len, kv_start, q_pos0, kv_cap, self.is_sliding,
@@ -1372,7 +1484,7 @@ class PackedDecoderLayer:
 
         # 5. Fused Gate*Attn + RHT-3072 -> O projection -> Post-Attn ShortConv4 (+ Residual)
         o_rot = rht_in_3072_gated_fast(attn_out, o_gate_raw, self.o_stage.signs_in, out_dtype=mx.float16)
-        o_out = self.o_stage.matmul_rotated_f16(o_rot, T)
+        o_out = self.o_stage.matmul_rotated_f16(o_rot, T, W_cached=o_w_cached)
         if self.o_out_rot is not None:
             o_out = rht_apply_out(o_out, self.o_out_rot)
         pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
@@ -1537,6 +1649,7 @@ class Inkling2LoopPackedMLX:
         cache: Inkling2Cache,
         all_logits: bool = False,
         argmax_only: bool = False,
+        ordered_only: bool = False,
         tap_visits: tuple[int, ...] = (),
         tree_spec: dict | None = None,
     ):
@@ -1561,25 +1674,35 @@ class Inkling2LoopPackedMLX:
                 n_blocks += 1
             h = new_h
             visit += 1
-            if T <= 8 and (visit & 3) == 0:
+            if (visit & 3) == 0:
                 mx.async_eval(h)
 
         pre_loop_h = h
         pre_loop_blocks = blocks_cat
         num_pre = n_blocks
 
+        # For T >= 64 prefill, reuse dequantized FP16 QKV & O weights across the 3 loop passes of L6..17
+        cache_loop_w = (T >= 64) and (cfg.loop_passes > 1)
+        loop_w_cache: dict[int, tuple[mx.array, mx.array]] = {}
+
         # 2. Pass 0 over loop layers (L6..17)
         for i in range(cfg.loop_start, cfg.loop_end):
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
+            if cache_loop_w:
+                wq_c = L.qkv_stage.dequant_f16()
+                wo_c = L.o_stage.dequant_f16()
+                loop_w_cache[i] = (wq_c, wo_c)
+            else:
+                wq_c = wo_c = None
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec, qkv_w_cached=wq_c, o_w_cached=wo_c)
             if L.is_block_boundary:
                 blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                 n_blocks += 1
             h = new_h
             visit += 1
-            if T <= 8 and (visit & 3) == 0:
+            if (visit & 3) == 0:
                 mx.async_eval(h)
 
         # 3. Passes 1..loop_passes-1 over loop layers with cross-pass messages
@@ -1597,14 +1720,17 @@ class Inkling2LoopPackedMLX:
                     captured[visit] = h
                 L = self.layers[i]
                 msgs = block_attn_res_fused(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)  # [4, T, 2304]
-                new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset, messages=msgs, tree_spec=tree_spec)
+                wq_c, wo_c = loop_w_cache[i] if cache_loop_w else (None, None)
+                new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset, messages=msgs, tree_spec=tree_spec, qkv_w_cached=wq_c, o_w_cached=wo_c)
                 if L.is_block_boundary:
                     blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
                     n_blocks += 1
                 h = new_h
                 visit += 1
-                if T <= 8 and (visit & 3) == 0:
+                if (visit & 3) == 0:
                     mx.async_eval(h)
+        if cache_loop_w:
+            loop_w_cache.clear()
 
         # 4. Post-loop layers (L18..23)
         for i in range(cfg.loop_end, cfg.num_hidden_layers):
@@ -1617,16 +1743,25 @@ class Inkling2LoopPackedMLX:
                 n_blocks += 1
             h = new_h
             visit += 1
-            if T <= 8 and (visit & 3) == 0 and visit < 48:
+            if (visit & 3) == 0 and visit < 48:
                 mx.async_eval(h)
 
         # 5. Final AttnRes + norm + unpadded lm_head
-        h = block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]  # [T, 2304]
-        if visit in tap_set:
-            captured[visit] = h
+        if not all_logits and visit not in tap_set and T > 1:
+            b_last = blocks_cat[:, -1:, :] if (blocks_cat is not None and n_blocks > 0) else blocks_cat
+            h_in = block_attn_res_fused(self.final_in_q, b_last, n_blocks, h[-1:, :], norm_w=self.final_norm_w)[0][None, :, :]
+        else:
+            h = block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]  # [T, 2304]
+            if visit in tap_set:
+                captured[visit] = h
+            h_in = h[None, :, :] if all_logits else h[-1:, :][None, :, :]
         cache.seq_len += T
-        h_in = h[None, :, :] if all_logits else h[-1:, :][None, :, :]
-        out = self.lm_head.argmax(h_in) if argmax_only else self.lm_head(h_in)
+        if argmax_only:
+            out = self.lm_head.argmax(h_in)
+        elif ordered_only:
+            out = self.lm_head.ordered_logits(h_in)
+        else:
+            out = self.lm_head(h_in)
         if tap_visits:
             taps = mx.stack([captured[v] for v in tap_visits], axis=1)  # [T, len(taps), H]
             return out, cache, taps
@@ -1638,13 +1773,14 @@ class Inkling2LoopPackedMLX:
         cache: Inkling2Cache | None = None,
         all_logits: bool = False,
         argmax_only: bool = False,
+        ordered_only: bool = False,
         tap_visits: tuple[int, ...] = (),
         tree_spec: dict | None = None,
     ):
         if cache is None:
             cache = self.make_cache()
         if self._fast:
-            return self._forward_core_fast(input_ids, cache, all_logits=all_logits, argmax_only=argmax_only, tap_visits=tap_visits, tree_spec=tree_spec)
+            return self._forward_core_fast(input_ids, cache, all_logits=all_logits, argmax_only=argmax_only, ordered_only=ordered_only, tap_visits=tap_visits, tree_spec=tree_spec)
         cfg = self.cfg
         h = self.embed(input_ids)
         T = h.shape[1]
@@ -1712,7 +1848,12 @@ class Inkling2LoopPackedMLX:
             captured[visit] = h[0].astype(mx.float32)
         cache.seq_len += T
         h_in = h if all_logits else h[:, -1:, :]
-        out = self.lm_head.argmax(h_in) if argmax_only else self.lm_head(h_in)
+        if argmax_only:
+            out = self.lm_head.argmax(h_in)
+        elif ordered_only:
+            out = self.lm_head.ordered_logits(h_in)
+        else:
+            out = self.lm_head(h_in)
         if tap_visits:
             taps = mx.stack([captured[v] for v in tap_visits], axis=1)
             return out, cache, taps
@@ -1723,6 +1864,12 @@ class Inkling2LoopPackedMLX:
 
     def forward_all_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = (), tree_spec: dict | None = None):
         return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=False, tap_visits=tap_visits, tree_spec=tree_spec)
+
+    def forward_ordered_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
+        return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=False, ordered_only=True, tap_visits=tap_visits)
+
+    def forward_all_ordered_logits(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = (), tree_spec: dict | None = None):
+        return self._forward_core(input_ids, cache=cache, all_logits=True, argmax_only=False, ordered_only=True, tap_visits=tap_visits, tree_spec=tree_spec)
 
     def forward_argmax(self, input_ids: list[int] | np.ndarray | mx.array, cache: Inkling2Cache | None = None, tap_visits: tuple[int, ...] = ()):
         return self._forward_core(input_ids, cache=cache, all_logits=False, argmax_only=True, tap_visits=tap_visits)

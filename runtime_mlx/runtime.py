@@ -427,7 +427,7 @@ class Runtime:
             emitted_total = 0
             stopped = False
             t_start = time.perf_counter()
-            if use_drafter and self.drafter is not None and temp == 0.0:
+            if use_drafter and self.drafter is not None and temp >= 0.0:
                 gen = stream_dspark(
                     self.model,
                     self.drafter,
@@ -435,6 +435,8 @@ class Runtime:
                     max_tokens=max_tokens,
                     eos_ids=eos,
                     adaptive=adaptive,
+                    temp=temp,
+                    top_p=top_p,
                     stats_out=stats,
                 )
             else:
