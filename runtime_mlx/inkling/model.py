@@ -55,6 +55,7 @@ from .fast_kernels import (
 from .kernels import (
     HASH_MULT_U32,
     lm_dense_matmul,
+    nvfp4_matvec,
     rht_apply_in,
     rht_apply_out,
     trellis_dense_matmul,
@@ -62,6 +63,7 @@ from .kernels import (
     trellis_moe_grouped,
 )
 
+NVFP4_FID = 7
 ID_TO_FMT = {0: "ht1", 1: "ht2", 2: "ht3", 3: "rtr1", 4: "rtr2", 5: "rtr3", 6: "rtr4"}
 FMT_PARAMS = {
     "ht1": (1, 4, 512, HASH_MULT_U32),
@@ -583,17 +585,42 @@ class PackedMoE:
             if dk in arrays:
                 dn_slabs.append((fid, mx.array(arrays[dk]), mx.array(arrays[f"dn_{fmt}_scales"]), luts[fmt], FMT_PARAMS[fmt]))
 
+        gu_nvfp4 = None
+        dn_nvfp4 = None
+        if "gu_nvfp4_codes" in arrays:
+            c_u32 = np.ascontiguousarray(arrays["gu_nvfp4_codes"], dtype=np.uint8).view(np.uint32)
+            gu_nvfp4 = (
+                mx.array(c_u32),
+                mx.array(np.ascontiguousarray(arrays["gu_nvfp4_scales"], dtype=np.uint8)),
+                mx.array(np.ascontiguousarray(arrays["gu_nvfp4_outer"], dtype=np.float32)),
+            )
+        if "dn_nvfp4_codes" in arrays:
+            c_u32 = np.ascontiguousarray(arrays["dn_nvfp4_codes"], dtype=np.uint8).view(np.uint32)
+            dn_nvfp4 = (
+                mx.array(c_u32),
+                mx.array(np.ascontiguousarray(arrays["dn_nvfp4_scales"], dtype=np.uint8)),
+                mx.array(np.ascontiguousarray(arrays["dn_nvfp4_outer"], dtype=np.float32)),
+            )
+
         if self._fast:
-            self.gu_unified = UnifiedMoESide(gu_slabs, gu_map_fid, gu_map_loc, 2 * cfg.intermediate_size, cfg.hidden_size, fast_luts)
-            self.dn_unified = UnifiedMoESide(dn_slabs, dn_map_fid, dn_map_loc, cfg.hidden_size, cfg.intermediate_size, fast_luts)
+            self.gu_unified = UnifiedMoESide(gu_slabs, gu_map_fid, gu_map_loc, 2 * cfg.intermediate_size, cfg.hidden_size, fast_luts, nvfp4_slab=gu_nvfp4)
+            self.dn_unified = UnifiedMoESide(dn_slabs, dn_map_fid, dn_map_loc, cfg.hidden_size, cfg.intermediate_size, fast_luts, nvfp4_slab=dn_nvfp4)
             self.gu_slabs = []
             self.dn_slabs = []
+            self.gu_nvfp4 = None
+            self.dn_nvfp4 = None
+            self.e2m1_lut = None
+            self.e4m3_lut = None
         else:
             self.gu_map_fid, self.gu_map_loc = gu_map_fid, gu_map_loc
             self.dn_map_fid, self.dn_map_loc = dn_map_fid, dn_map_loc
             self._sentinel = mx.array(0xFFFFFFFF, dtype=mx.uint32)
             self.gu_slabs = gu_slabs
             self.dn_slabs = dn_slabs
+            self.gu_nvfp4 = gu_nvfp4
+            self.dn_nvfp4 = dn_nvfp4
+            self.e2m1_lut = luts.get("nvfp4_e2m1")
+            self.e4m3_lut = luts.get("nvfp4_e4m3")
 
     def forward_fast_fused_prerot(
         self,
@@ -636,14 +663,23 @@ class PackedMoE:
                 eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
             gu_plan = dn_plan = None
             sc = compute_moe_sorted_offsets(eids_flat) if T > 8 else None
+        need_dn_raw = self.dn_unified.has_nvfp4
         if dyn:
-            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan, dynamic_routing=True)
-            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, eids_flat=eids_flat)
-            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, dynamic_routing=True)
+            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan, dynamic_routing=True, x_raw_f16=h_mlp_f16)
+            if need_dn_raw:
+                act_rot, act_raw = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, eids_flat=eids_flat, also_raw=True)
+            else:
+                act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, eids_flat=eids_flat)
+                act_raw = None
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, dynamic_routing=True, x_raw_f16=act_raw)
         else:
-            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan)
-            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
-            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan)
+            y_gu = self.gu_unified(x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=sc, plan=gu_plan, x_raw_f16=h_mlp_f16)
+            if need_dn_raw:
+                act_rot, act_raw = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, also_raw=True)
+            else:
+                act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+                act_raw = None
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, plan=dn_plan, x_raw_f16=act_raw)
 
         prev = cache.get_conv_prev(cache_slot, 3, 2304)
         out, new_prev, raw_sum = moe_wsum_sconv4_res_fused(y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn)
@@ -671,13 +707,18 @@ class PackedMoE:
         flat = hidden_states.reshape(N, H).astype(mx.float32)
 
         if self._fast:
-            logits_f16 = flat.astype(mx.float16) @ self.router_w_f16.T
+            flat_f16 = flat.astype(mx.float16)
+            logits_f16 = flat_f16 @ self.router_w_f16.T
             eids_flat, w_norm = sigmoid_top8_norm_fast(logits_f16, self.router_bias, self.cfg.route_scale)
             x_rot = rht_in_2304_fast(flat, self.gu_signs_in, n_signs=1, T=N, out_dtype=mx.float16)
             sc = compute_moe_sorted_offsets(eids_flat) if N > 8 else None
-            y_gu = self.gu_unified(x_rot, eids_flat, x_div=8, sorted_cache=sc)
-            act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
-            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc)
+            y_gu = self.gu_unified(x_rot, eids_flat, x_div=8, sorted_cache=sc, x_raw_f16=flat_f16)
+            if self.dn_unified.has_nvfp4:
+                act_rot, act_raw = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16, also_raw=True)
+            else:
+                act_rot = swiglu_rht_1152_fast(y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap, out_dtype=mx.float16)
+                act_raw = None
+            y_dn = self.dn_unified(act_rot, eids_flat, x_div=1, sorted_cache=sc, x_raw_f16=act_raw)
             out = mx.sum(y_dn.reshape(N, 8, 2304) * w_norm.reshape(N, 8, 1), axis=1)
             return out.reshape(B, T, H)
 
@@ -694,31 +735,51 @@ class PackedMoE:
         dn_fids = self.dn_map_fid[eids_flat]
         dn_locs = self.dn_map_loc[eids_flat]
 
-        x_rot = rht_apply_in(flat, self.gu_signs_in)
         use_grouped = 2 <= N <= 8
         moe_fn = trellis_moe_grouped if use_grouped else trellis_matvec
-        single_gu = len(self.gu_slabs) == 1
+        single_gu = (len(self.gu_slabs) == 1) and (self.gu_nvfp4 is None)
         y_gu_total = None
-        for fid, codes, scales, lut, (k, g, K, hmult) in self.gu_slabs:
-            locs_f = gu_locs if single_gu else mx.where(gu_fids == fid, gu_locs, self._sentinel)
-            y_f = moe_fn(
-                x_rot, codes, scales, lut, locs_f,
-                2 * self.cfg.intermediate_size, self.cfg.hidden_size, k, g, K, hmult, x_div=K_top,
+        if self.gu_slabs:
+            x_rot = rht_apply_in(flat, self.gu_signs_in)
+            for fid, codes, scales, lut, (k, g, K, hmult) in self.gu_slabs:
+                locs_f = gu_locs if single_gu else mx.where(gu_fids == fid, gu_locs, self._sentinel)
+                y_f = moe_fn(
+                    x_rot, codes, scales, lut, locs_f,
+                    2 * self.cfg.intermediate_size, self.cfg.hidden_size, k, g, K, hmult, x_div=K_top,
+                )
+                y_gu_total = y_f if y_gu_total is None else (y_gu_total + y_f)
+        if self.gu_nvfp4 is not None:
+            c_u32, s_u8, o_f32 = self.gu_nvfp4
+            locs_nv = gu_locs if len(self.gu_slabs) == 0 else mx.where(gu_fids == NVFP4_FID, gu_locs, self._sentinel)
+            y_nv = nvfp4_matvec(
+                flat, c_u32, s_u8, o_f32, locs_nv,
+                2 * self.cfg.intermediate_size, self.cfg.hidden_size, x_div=K_top,
+                e2m1_lut=self.e2m1_lut, e4m3_lut=self.e4m3_lut,
             )
-            y_gu_total = y_f if y_gu_total is None else (y_gu_total + y_f)
+            y_gu_total = y_nv if y_gu_total is None else (y_gu_total + y_nv)
 
         act = softcapped_swiglu(y_gu_total, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap)
-        act_rot = rht_apply_in(act, self.dn_signs_in)
 
-        single_dn = len(self.dn_slabs) == 1
+        single_dn = (len(self.dn_slabs) == 1) and (self.dn_nvfp4 is None)
         y_dn_total = None
-        for fid, codes, scales, lut, (k, g, K, hmult) in self.dn_slabs:
-            locs_f = dn_locs if single_dn else mx.where(dn_fids == fid, dn_locs, self._sentinel)
-            y_f = moe_fn(
-                act_rot, codes, scales, lut, locs_f,
-                self.cfg.hidden_size, self.cfg.intermediate_size, k, g, K, hmult, x_div=1,
+        if self.dn_slabs:
+            act_rot = rht_apply_in(act, self.dn_signs_in)
+            for fid, codes, scales, lut, (k, g, K, hmult) in self.dn_slabs:
+                locs_f = dn_locs if single_dn else mx.where(dn_fids == fid, dn_locs, self._sentinel)
+                y_f = moe_fn(
+                    act_rot, codes, scales, lut, locs_f,
+                    self.cfg.hidden_size, self.cfg.intermediate_size, k, g, K, hmult, x_div=1,
+                )
+                y_dn_total = y_f if y_dn_total is None else (y_dn_total + y_f)
+        if self.dn_nvfp4 is not None:
+            c_u32, s_u8, o_f32 = self.dn_nvfp4
+            locs_nv = dn_locs if len(self.dn_slabs) == 0 else mx.where(dn_fids == NVFP4_FID, dn_locs, self._sentinel)
+            y_nv = nvfp4_matvec(
+                act, c_u32, s_u8, o_f32, locs_nv,
+                self.cfg.hidden_size, self.cfg.intermediate_size, x_div=1,
+                e2m1_lut=self.e2m1_lut, e4m3_lut=self.e4m3_lut,
             )
-            y_dn_total = y_f if y_dn_total is None else (y_dn_total + y_f)
+            y_dn_total = y_nv if y_dn_total is None else (y_dn_total + y_nv)
 
         out = mx.sum(y_dn_total.reshape(N, K_top, H) * w_norm[:, :, None], axis=1)
         return out.reshape(B, T, H)

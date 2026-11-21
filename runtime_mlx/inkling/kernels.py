@@ -914,6 +914,155 @@ def lm_dense_matmul(
     return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
 
 
+# ----------------------------------------------------------------------------- Half-Warp Native NVFP4 MoE Metal Kernel
+
+NVFP4_E2M1_F32 = np.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=np.float32,
+)
+
+
+@lru_cache(maxsize=1)
+def nvfp4_luts_mx() -> tuple[mx.array, mx.array]:
+    """Cached `(e2m1_lut[16], e4m3_lut[256])` float32 lookup tables on MLX."""
+    e4m3 = np.zeros(256, dtype=np.float32)
+    for b in range(256):
+        sign = -1.0 if (b & 0x80) else 1.0
+        exp = (b >> 3) & 0xF
+        mant = b & 0x7
+        if exp == 15 and mant == 7:
+            e4m3[b] = 0.0
+        elif exp == 0:
+            e4m3[b] = sign * (mant / 8.0) * (2.0 ** -6)
+        else:
+            e4m3[b] = sign * (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
+    return mx.array(NVFP4_E2M1_F32), mx.array(e4m3)
+
+
+@lru_cache(maxsize=16)
+def make_halfwarp_nvfp4_kernel(n: int, sg: int = 16, rps: int = 4):
+    """Half-warp MoE Metal kernel for exact native NVFP4 (`4.50 bpp`: 4-bit E2M1 + FP8 E4M3 group-16 + FP32 outer)."""
+    assert n % 128 == 0, f"NVFP4 kernel expects n divisible by 128, got n={n}"
+    iters = n // 128
+    wpr = n // 8   # uint32 words per row (8 nibbles per uint32)
+    spr = n // 16  # uint8 E4M3 block scales per row
+
+    header = f"#define RPS {rps}u\n#define SG {sg}u\n"
+    L = []
+    a = L.append
+    a("const uint tg = threadgroup_position_in_grid.x;")
+    a("const uint simd = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;")
+    a("const uint hw = lane >> 4, hl = lane & 15u;")
+    a("const uint tid = simd * 32u + lane;")
+    a("const uint m_rows = meta[0];")
+    a("const uint n_slots = meta[1];")
+    a("const uint x_div = meta[2];")
+    a("const uint ntg = meta[3];")
+    a("if (n_slots == 0u) return;")
+    a("threadgroup float tg_e2m1[16];")
+    a("threadgroup float tg_e4m3[256];")
+    a("if (tid < 16u) tg_e2m1[tid] = e2m1_lut[tid];")
+    a(f"for (uint idx = tid; idx < 256u; idx += {sg * 32}u) tg_e4m3[idx] = e4m3_lut[idx];")
+    a("threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+    a("const uint blocks_per_slot = (m_rows + RPS - 1u) / RPS;")
+    a("const uint total_blocks = n_slots * blocks_per_slot;")
+    a("const uint blocks_per_tg = SG * 2u;")
+    a(f"const ulong expert_code_stride = (ulong)m_rows * {wpr}u;")
+    a(f"const ulong expert_scale_stride = (ulong)m_rows * {spr}u;")
+    a("for (uint rb = tg; rb * blocks_per_tg < total_blocks; rb += ntg) {")
+    a("    const uint gb = rb * blocks_per_tg + simd * 2u + hw;")
+    a("    if (gb >= total_blocks) continue;")
+    a("    const uint slot = gb / blocks_per_slot;")
+    a("    const uint r0 = (gb - slot * blocks_per_slot) * RPS;")
+    a("    const uint eid = expert_ids[slot];")
+    a("    if (eid == 0xFFFFFFFFu) {")
+    a("        if (hl == 0u) {")
+    a("            #pragma unroll")
+    a("            for (uint r = 0; r < RPS; r++) {")
+    a("                if (r0 + r < m_rows) y[(ulong)slot * m_rows + r0 + r] = 0.0f;")
+    a("            }")
+    a("        }")
+    a("        continue;")
+    a("    }")
+    a("    const uint x_row = (x_div == 1u) ? slot : (slot / x_div);")
+    a(f"    const device float* xs = x + (ulong)x_row * {n}u;")
+    a("    const device uint* ecodes = codes + (ulong)eid * expert_code_stride;")
+    a("    const device uchar* escales = scales + (ulong)eid * expert_scale_stride;")
+    a("    const float eouter = outer[eid];")
+    a("    float acc[RPS];")
+    a("    for (uint r = 0; r < RPS; r++) acc[r] = 0.0f;")
+    a(f"    for (uint it = 0; it < {iters}u; it++) {{")
+    a("        const uint c = hl + 16u * it;")
+    a("        const uint sc_idx = c >> 1;")
+    a("        float xr[8];")
+    for j in range(8):
+        a(f"        xr[{j}] = xs[c * 8u + {j}u];")
+    a("        #pragma unroll")
+    a("        for (uint r = 0; r < RPS; r++) {")
+    a("            const uint row = min(r0 + r, m_rows - 1u);")
+    a(f"            const uint pk = ecodes[(ulong)row * {wpr}u + c];")
+    a(f"            const float bsc = tg_e4m3[escales[(ulong)row * {spr}u + sc_idx]];")
+    terms = " + ".join(f"tg_e2m1[(pk >> {4 * j}u) & 15u] * xr[{j}]" for j in range(8))
+    a(f"            acc[r] += ({terms}) * bsc;")
+    a("        }")
+    a("    }")
+    a("    #pragma unroll")
+    a("    for (uint r = 0; r < RPS; r++) {")
+    a("        float s = acc[r];")
+    a("        s += simd_shuffle_xor(s, 8u);")
+    a("        s += simd_shuffle_xor(s, 4u);")
+    a("        s += simd_shuffle_xor(s, 2u);")
+    a("        s += simd_shuffle_xor(s, 1u);")
+    a("        if (hl == 0u && r0 + r < m_rows) y[(ulong)slot * m_rows + r0 + r] = s * eouter;")
+    a("    }")
+    a("}")
+    return mx.fast.metal_kernel(
+        name=f"hw_nvfp4_n{n}",
+        input_names=["x", "codes", "scales", "outer", "e2m1_lut", "e4m3_lut", "expert_ids", "meta"],
+        output_names=["y"],
+        header=header,
+        source="\n".join(L),
+    )
+
+
+def nvfp4_matvec(
+    x: mx.array,
+    codes_u32: mx.array,
+    scales_u8: mx.array,
+    outer_f32: mx.array,
+    expert_ids: mx.array,
+    m: int,
+    n: int,
+    tg_count: int = 80,
+    x_div: int = 1,
+    e2m1_lut: mx.array | None = None,
+    e4m3_lut: mx.array | None = None,
+) -> mx.array:
+    """Execute half-warp native NVFP4 MoE matvec on unrotated `x`; returns float32[n_slots, m]."""
+    n_slots = int(expert_ids.shape[0])
+    blocks_per_slot = (m + 3) // 4
+    total_blocks = n_slots * blocks_per_slot
+    ntg = max(1, min(tg_count, (total_blocks + 31) // 32))
+    if e2m1_lut is None or e4m3_lut is None:
+        e2m1_d, e4m3_d = nvfp4_luts_mx()
+        e2m1_lut = e2m1_d if e2m1_lut is None else e2m1_lut
+        e4m3_lut = e4m3_d if e4m3_lut is None else e4m3_lut
+    kern = make_halfwarp_nvfp4_kernel(n)
+    meta = _meta_u32(m, n_slots, int(x_div), ntg)
+    out = kern(
+        inputs=[
+            x.reshape(-1), codes_u32.reshape(-1), scales_u8.reshape(-1), outer_f32.reshape(-1),
+            e2m1_lut, e4m3_lut, expert_ids, meta,
+        ],
+        grid=(ntg * 16 * 32, 1, 1),
+        threadgroup=(16 * 32, 1, 1),
+        output_shapes=[(n_slots * m,)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return out.reshape(n_slots, m)
+
+
 def _selftest():
     """Verify bit-exact parity (< 1e-4 vs float64 numpy reference) for ALL kernels on M5 Max."""
     rng = np.random.default_rng(7)

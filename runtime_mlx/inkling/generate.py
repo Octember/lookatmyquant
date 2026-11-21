@@ -362,6 +362,11 @@ def stream_serial(
     eos = set(int(x) for x in eos_ids)
     greedy = temp <= 0.0
     old_wire = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    t0: float | None = None
+    t1: float | None = None
+    emitted = 0
+    step_ms: list[float] = []
+    next_pending: mx.array | None = None
     try:
         cache = m.make_cache()
         t0 = time.perf_counter()
@@ -379,7 +384,6 @@ def stream_serial(
 
         emitted = 1
         yield [nxt]
-        step_ms: list[float] = []
         if nxt not in eos and max_tokens > 1:
             if greedy:
                 # 1-step async_eval pipeline overlaps Python enqueue of step k+1 with GPU execution of step k!
@@ -403,6 +407,7 @@ def stream_serial(
                     if nxt in eos:
                         break
                     pending_mx = next_pending
+                    next_pending = None
             else:
                 for _ in range(max_tokens - 1):
                     ts = time.perf_counter()
@@ -416,8 +421,11 @@ def stream_serial(
                     yield [nxt]
                     if nxt in eos:
                         break
-        t2 = time.perf_counter()
-        if stats_out is not None:
+    finally:
+        if next_pending is not None:
+            mx.eval(next_pending)
+        if stats_out is not None and t0 is not None and t1 is not None:
+            t2 = time.perf_counter()
             decode_s = max(t2 - t1, 1e-9)
             decode_toks = max(emitted - 1, 0)
             stats_out.update(
@@ -437,7 +445,6 @@ def stream_serial(
                     "peak_gb": round(mx.get_peak_memory() / 1e9, 3),
                 }
             )
-    finally:
         mx.set_wired_limit(old_wire)
 
 
@@ -491,6 +498,17 @@ def stream_dspark(
         draft_head = m.lm_head.get_draft_head_argmax()
 
     old_wire = mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    t0: float | None = None
+    t1: float | None = None
+    t2: float | None = None
+    emitted_total = 0
+    accepted_per_round: list[int] = []
+    round_ms: list[float] = []
+    serial_steps = 0
+    branch_hits = 0
+    ngram_rounds = 0
+    ngram_accepted = 0
+    ngram_first_rejects = 0
     try:
         drafter.reset()
         cache = m.make_cache()
@@ -521,14 +539,7 @@ def stream_dspark(
         anchor = first
         yield [first]
 
-        accepted_per_round: list[int] = []
-        round_ms: list[float] = []
-        serial_steps = 0
-        branch_hits = 0
         dspark_rounds = 0
-        ngram_rounds = 0
-        ngram_accepted = 0
-        ngram_first_rejects = 0
         ewma_accept = 3.0
         serial_cooldown = 0
         serial_burst_len = 8
@@ -825,9 +836,9 @@ def stream_dspark(
             round_ms.append((time.perf_counter() - tr0) * 1e3)
             if chunk:
                 yield chunk
-
-        t3 = time.perf_counter()
-        if stats_out is not None:
+    finally:
+        if stats_out is not None and t0 is not None and t1 is not None and t2 is not None:
+            t3 = time.perf_counter()
             decode_s = max(t3 - t2, 1e-9)
             decode_toks = max(emitted_total - 1, 0)
             mean_acc = sum(accepted_per_round) / max(len(accepted_per_round), 1)
@@ -862,7 +873,6 @@ def stream_dspark(
                     "peak_gb": round(mx.get_peak_memory() / 1e9, 3),
                 }
             )
-    finally:
         mx.set_wired_limit(old_wire)
 
 

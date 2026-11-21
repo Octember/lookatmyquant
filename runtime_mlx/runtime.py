@@ -449,25 +449,28 @@ class Runtime:
                     top_p=top_p,
                     stats_out=stats,
                 )
-            for raw_chunk in gen:
-                kept: list[int] = []
-                for tid in raw_chunk:
-                    tid = int(tid)
-                    if tid in eos:
-                        stopped = True
+            try:
+                for raw_chunk in gen:
+                    kept: list[int] = []
+                    for tid in raw_chunk:
+                        tid = int(tid)
+                        if tid in eos:
+                            stopped = True
+                            break
+                        kept.append(tid)
+                    emitted_total += len(kept)
+                    text = decoder.push(kept)
+                    if kept or text:
+                        yield Chunk(
+                            text=text,
+                            token_ids=kept,
+                            prompt_tokens=len(ids),
+                            generation_tokens=emitted_total,
+                        )
+                    if stopped:
                         break
-                    kept.append(tid)
-                emitted_total += len(kept)
-                text = decoder.push(kept)
-                if kept or text:
-                    yield Chunk(
-                        text=text,
-                        token_ids=kept,
-                        prompt_tokens=len(ids),
-                        generation_tokens=emitted_total,
-                    )
-                if stopped:
-                    break
+            finally:
+                gen.close()
             tail = decoder.finalize()
             prompt_s = float(stats.get("prompt_s", 0.0)) + float(stats.get("drafter_prompt_s", 0.0))
             rounds_s = float(stats.get("rounds_s", 0.0))
@@ -494,7 +497,7 @@ class Runtime:
             emitted_total = 0
             stopped = False
             t_start = time.perf_counter()
-            for raw_chunk in drafter_q35.stream(
+            gen_q35 = drafter_q35.stream(
                 self.model,
                 self.block,
                 self.drafter,
@@ -505,25 +508,29 @@ class Runtime:
                 mode=mode,
                 adaptive=adaptive,
                 stats_out=stats,
-            ):
-                kept: list[int] = []
-                for tid in raw_chunk:
-                    tid = int(tid)
-                    if tid in eos:
-                        stopped = True
+            )
+            try:
+                for raw_chunk in gen_q35:
+                    kept: list[int] = []
+                    for tid in raw_chunk:
+                        tid = int(tid)
+                        if tid in eos:
+                            stopped = True
+                            break
+                        kept.append(tid)
+                    emitted_total += len(kept)
+                    text = decoder.push(kept)
+                    if kept or text:
+                        yield Chunk(
+                            text=text,
+                            token_ids=kept,
+                            prompt_tokens=len(ids),
+                            generation_tokens=emitted_total,
+                        )
+                    if stopped:
                         break
-                    kept.append(tid)
-                emitted_total += len(kept)
-                text = decoder.push(kept)
-                if kept or text:
-                    yield Chunk(
-                        text=text,
-                        token_ids=kept,
-                        prompt_tokens=len(ids),
-                        generation_tokens=emitted_total,
-                    )
-                if stopped:
-                    break
+            finally:
+                gen_q35.close()
             tail = decoder.finalize()
             prompt_s = float(stats.get("prompt_s", 0.0)) + float(stats.get("drafter_prompt_s", 0.0))
             rounds_s = float(stats.get("rounds_s", 0.0))

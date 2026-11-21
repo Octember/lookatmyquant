@@ -289,6 +289,31 @@ def test_mini_model_and_runtime_integration() -> None:
         assert c_tr.offset == 8
         assert all(k is not None and k.shape[2] == 8 for k in c_tr.keys)
 
+        # Early-break stats_out & Runtime EOS-stop check
+        from runtime_mlx import Runtime
+        from runtime_mlx.inkling.generate import stream_serial
+
+        st_early: dict = {}
+        emitted_seq: list[int] = []
+        gen_s = stream_serial(model, toks[:4], max_tokens=8, eos_ids=(), stats_out=st_early)
+        for idx_s, ch_s in enumerate(gen_s):
+            emitted_seq.extend(ch_s)
+            if idx_s == 2:
+                break
+        gen_s.close()
+        assert st_early.get("generated_tokens") == 3 and "decode_tok_s" in st_early, f"missing stats on early break: {st_early}"
+
+        class _DummyTok:
+            eos_token_id = emitted_seq[2]
+            eos_token_ids = (emitted_seq[2],)
+
+            def decode(self, ids, skip_special_tokens=True):
+                return " ".join(str(x) for x in ids)
+
+        rt_mini = Runtime(wrapped, _DummyTok(), format_name="inkling2-packed")
+        r_stop = rt_mini.generate(toks[:4], chat=False, max_tokens=8, use_drafter=False)
+        assert r_stop.finish_reason == "stop" and r_stop.prompt_tps > 0.0 and "decode_tok_s" in r_stop.stats, f"bad EOS stop result: {r_stop}"
+
         # Drafter file resolution test
         ddir = pdir / "drafter"
         ddir.mkdir()
@@ -385,6 +410,167 @@ def test_tree_spec_and_kernels() -> None:
         assert err < 1e-4, f"tree SDPA mismatch on node {ni}: {err}"
 
 
+def test_nvfp4_unified_moe_all_modes() -> None:
+    """Verify `nvfp4` (`fid=7`) across `t1`, `grouped`, `prefill_mpp`, `prefill_v2`, `also_raw`, and `PackedMoE`."""
+    from runtime_mlx.inkling.fast_kernels import (
+        UnifiedMoESide,
+        _make_unified_moe_prefill_v2_kernel,
+        _u32,
+        build_fast_luts,
+        compute_moe_sorted_offsets,
+        plan_moe_prefill_units,
+        swiglu_rht_1152_fast,
+    )
+    from runtime_mlx.inkling.kernels import nvfp4_luts_mx
+    from runtime_mlx.inkling.model import Inkling2Config, PackedMoE, softcapped_swiglu
+
+    rng = np.random.default_rng(4242)
+    e2m1_mx, e4m3_mx = nvfp4_luts_mx()
+    e2m1_np, e4m3_np = np.array(e2m1_mx, dtype=np.float64), np.array(e4m3_mx, dtype=np.float64)
+
+    # 1. Verify `swiglu_rht_1152_fast(..., also_raw=True)` at n_slots=8 (w/ sentinel) and n_slots=96
+    signs = mx.array(rng.choice([-1.0, 1.0], size=1152).astype(np.float32))
+    for n_slots, use_eids in [(8, True), (96, False)]:
+        y_gu = mx.array(rng.standard_normal((n_slots, 2304)).astype(np.float32) * 1.5)
+        eids_s = mx.array([0, 0xFFFFFFFF, 3, 5, 7, 9, 0xFFFFFFFF, 12], dtype=mx.uint32) if use_eids else None
+        rot_ref = swiglu_rht_1152_fast(y_gu, signs, out_dtype=mx.float16, eids_flat=eids_s)
+        rot_2, raw_2 = swiglu_rht_1152_fast(y_gu, signs, out_dtype=mx.float16, eids_flat=eids_s, also_raw=True)
+        raw_ref = softcapped_swiglu(y_gu, 4.0, 25.0).astype(mx.float16)
+        mx.eval(rot_ref, rot_2, raw_2, raw_ref)
+        if use_eids:
+            valid = np.array([0, 2, 3, 4, 5, 7])
+            assert float(np.max(np.abs(np.array(rot_2)[valid] - np.array(rot_ref)[valid]))) == 0.0
+            assert float(np.linalg.norm(np.array(raw_2)[valid] - np.array(raw_ref)[valid]) / np.linalg.norm(np.array(raw_ref)[valid])) <= 5e-4
+            assert float(np.max(np.abs(np.array(raw_2)[[1, 6]]))) == 0.0
+        else:
+            assert float(np.max(np.abs(np.array(rot_2) - np.array(rot_ref)))) == 0.0
+            assert float(np.linalg.norm(np.array(raw_2) - np.array(raw_ref)) / np.linalg.norm(np.array(raw_ref))) <= 5e-4
+
+    # 2. Verify `UnifiedMoESide` mixed (ht2 + nvfp4) and pure (nvfp4-only) across t1, grouped, mpp, AND v2!
+    luts = {
+        "ht2": mx.array(rng.standard_normal((512, 4)).astype(np.float16) * 0.4),
+        "nvfp4_e2m1": e2m1_mx,
+        "nvfp4_e4m3": e4m3_mx,
+    }
+    fast_luts = build_fast_luts(luts)
+    for pure_nv, n_cols, x_div in [(False, 2304, 8), (True, 1152, 1)]:
+        m_rows = 256
+        if pure_nv:
+            E_nv = 128
+            map_fid = np.full(128, 7, dtype=np.int32)
+            map_loc = np.arange(128, dtype=np.uint32)
+            slabs = []
+            ht2_c = ht2_s = None
+        else:
+            E_ht2, E_nv = 64, 64
+            map_fid = np.array([7 if e % 2 == 0 else 1 for e in range(128)], dtype=np.int32)
+            map_loc = np.array([e // 2 for e in range(128)], dtype=np.uint32)
+            ht2_c = _pack_u32_random(rng, (E_ht2, m_rows, (n_cols * 2) // 32))
+            ht2_s = rng.uniform(0.01, 0.04, size=(E_ht2, m_rows)).astype(np.float16)
+            slabs = [(1, mx.array(ht2_c), mx.array(ht2_s), luts["ht2"], FMT_PARAMS["ht2"])]
+
+        nv_c_u8 = rng.integers(0, 256, size=(E_nv, m_rows, n_cols // 2), dtype=np.uint8)
+        nv_s_u8 = rng.integers(32, 88, size=(E_nv, m_rows, n_cols // 16), dtype=np.uint8)
+        nv_out = rng.uniform(4e-5, 5e-4, size=(E_nv,)).astype(np.float32)
+        nv_slab = (mx.array(np.ascontiguousarray(nv_c_u8).view(np.uint32)), mx.array(nv_s_u8), mx.array(nv_out))
+
+        umoe = UnifiedMoESide(slabs, mx.array(map_fid), mx.array(map_loc), m_rows, n_cols, fast_luts, nvfp4_slab=nv_slab)
+
+        # Precompute exact FP64 weights for NVFP4 experts & reference trellis matvec for ht2 experts
+        W_nv_ref = np.empty((E_nv, m_rows, n_cols), dtype=np.float64)
+        for loc in range(E_nv):
+            vals = np.stack([e2m1_np[nv_c_u8[loc] & 0xF], e2m1_np[nv_c_u8[loc] >> 4]], axis=-1).reshape(m_rows, n_cols // 16, 16)
+            W_nv_ref[loc] = (vals * e4m3_np[nv_s_u8[loc]][..., None]).reshape(m_rows, n_cols) * float(nv_out[loc])
+
+        for T in (1, 6, 40):
+            n_slots = T * 8
+            x_rows = n_slots // x_div
+            x_rot = mx.array(rng.standard_normal((x_rows, n_cols)).astype(np.float16) * 0.5)
+            x_raw = mx.array(rng.standard_normal((x_rows, n_cols)).astype(np.float16) * 0.5)
+            # Force repeated hits (c1..c4+) across tokens while respecting Top-8 uniqueness per token (max count <= T <= 8)
+            pool = np.array([0, 1, 2, 3, 4, 5, 16, 17, 64, 65, 126, 127], dtype=np.uint32)
+            eids_np = np.concatenate([rng.choice(pool, size=8, replace=False) for _ in range(T)]).astype(np.uint32)
+            if T == 1:
+                eids_np[3] = 0xFFFFFFFF
+            eids_mx = mx.array(eids_np)
+
+            y_fast = umoe(x_rot, eids_mx, x_div=x_div, x_raw_f16=x_raw)
+            mx.eval(y_fast)
+            yf = np.array(y_fast, dtype=np.float64)
+
+            x_raw_np = np.array(x_raw, dtype=np.float64)
+            y_ref = np.zeros((n_slots, m_rows), dtype=np.float64)
+            for s in range(n_slots):
+                eid = int(eids_np[s])
+                if eid == 0xFFFFFFFF:
+                    continue
+                xr_idx = s if x_div == 1 else (s // x_div)
+                if map_fid[eid] == 7:
+                    y_ref[s] = x_raw_np[xr_idx] @ W_nv_ref[int(map_loc[eid])].T
+                else:
+                    loc_mx = mx.array([int(map_loc[eid])], dtype=mx.uint32)
+                    t_out = trellis_matvec(
+                        x_rot[xr_idx : xr_idx + 1].astype(mx.float32),
+                        mx.array(ht2_c), mx.array(ht2_s), luts["ht2"], loc_mx,
+                        m_rows, n_cols, *FMT_PARAMS["ht2"],
+                    )[0]
+                    mx.eval(t_out)
+                    y_ref[s] = np.array(t_out, dtype=np.float64)
+
+            valid_mask = eids_np != 0xFFFFFFFF
+            rel_err = float(np.linalg.norm(yf[valid_mask] - y_ref[valid_mask]) / np.linalg.norm(y_ref[valid_mask]))
+            assert rel_err < 1.5e-3, f"UnifiedMoESide nvfp4 mismatch (pure={pure_nv}, T={T}): rel_err={rel_err}"
+
+            # Also verify non-MPP `prefill_v2` fallback explicitly at T=40!
+            if T == 40:
+                offsets, order = compute_moe_sorted_offsets(eids_mx)
+                units, ucnt, max_u = plan_moe_prefill_units(offsets, umoe.exp_fid, umoe.fids, n_slots, tile_t=32)
+                sg_p, rb_p = 8, 2
+                rblocks = (m_rows + sg_p * 8 * rb_p - 1) // (sg_p * 8 * rb_p)
+                kern_v2 = _make_unified_moe_prefill_v2_kernel(n_cols, umoe.fids, sg=sg_p, rb=rb_p)
+                y_v2 = kern_v2(
+                    inputs=[
+                        x_rot.reshape(-1), umoe.codes, umoe.scales, umoe.exp_fid, umoe.exp_code_off, umoe.exp_scale_off,
+                        *umoe._lut_args_sg8, units, ucnt, _u32(m_rows, x_div), order, x_raw.reshape(-1), *umoe._nv_args,
+                    ],
+                    grid=(max_u * sg_p * 32, rblocks, 1),
+                    threadgroup=(sg_p * 32, 1, 1),
+                    output_shapes=[(n_slots, m_rows)],
+                    output_dtypes=[mx.float32],
+                )[0]
+                mx.eval(y_v2)
+                rel_v2 = float(np.linalg.norm(np.array(y_v2, dtype=np.float64) - y_ref) / np.linalg.norm(y_ref))
+                assert rel_v2 < 1.5e-3, f"prefill_v2 nvfp4 mismatch (pure={pure_nv}): rel_err={rel_v2}"
+
+    # 3. Verify full H=2304 `PackedMoE` (`use_fast_metal=True` vs `use_fast_metal=False` reference) at T=1, 4, 36
+    arrays_moe = {
+        "gu_signs_in": rng.choice([-1, 1], size=(2304,)).astype(np.int8),
+        "dn_signs_in": rng.choice([-1, 1], size=(1152,)).astype(np.int8),
+        "gu_map": np.array([[7 if e < 64 else 1, e if e < 64 else (e - 64)] for e in range(128)], dtype=np.int32),
+        "dn_map": np.array([[7, e] for e in range(128)], dtype=np.int32),
+        "gu_ht2_codes": _pack_u32_random(rng, (64, 2304, (2304 * 2) // 32)),
+        "gu_ht2_scales": rng.uniform(0.01, 0.03, size=(64, 2304)).astype(np.float16),
+        "gu_nvfp4_codes": rng.integers(0, 256, size=(64, 2304, 2304 // 2), dtype=np.uint8),
+        "gu_nvfp4_scales": rng.integers(32, 80, size=(64, 2304, 2304 // 16), dtype=np.uint8),
+        "gu_nvfp4_outer": rng.uniform(5e-5, 3e-4, size=(64,)).astype(np.float32),
+        "dn_nvfp4_codes": rng.integers(0, 256, size=(128, 2304, 1152 // 2), dtype=np.uint8),
+        "dn_nvfp4_scales": rng.integers(32, 80, size=(128, 2304, 1152 // 16), dtype=np.uint8),
+        "dn_nvfp4_outer": rng.uniform(5e-5, 3e-4, size=(128,)).astype(np.float32),
+    }
+    rw = mx.array(rng.standard_normal((128, 2304)).astype(np.float32) * 0.05)
+    rb = mx.array(rng.standard_normal((128,)).astype(np.float32) * 0.02)
+    cfg_fast = Inkling2Config()
+    moe_fast = PackedMoE(arrays_moe, luts, fast_luts, rw, rb, cfg_fast)
+    moe_ref = PackedMoE(arrays_moe, luts, None, rw, rb, cfg_fast)
+    for T in (1, 4, 36):
+        h_in = mx.array(rng.standard_normal((1, T, 2304)).astype(np.float16).astype(np.float32) * 0.4)
+        yf = moe_fast(h_in)
+        yr = moe_ref(h_in)
+        mx.eval(yf, yr)
+        rel = float(np.linalg.norm(np.array(yf) - np.array(yr)) / np.linalg.norm(np.array(yr)))
+        assert rel < 2.5e-3, f"PackedMoE fast vs ref mismatch at T={T}: rel={rel}"
+
+
 def test_fast_kernels_suite() -> None:
     """Verify all H=2304 Apple Silicon fast Metal kernels against exact references."""
     from runtime_mlx.inkling.fast_kernels import _selftest
@@ -396,6 +582,7 @@ def main() -> None:
     test_mini_model_and_runtime_integration()
     test_moe_grouped_large_expert_count_parity()
     test_tree_spec_and_kernels()
+    test_nvfp4_unified_moe_all_modes()
     test_fast_kernels_suite()
     print("ALL INKLING MLX RUNTIME TESTS PASSED!", flush=True)
 
