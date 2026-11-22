@@ -43,6 +43,7 @@ COST = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0}         # relative time a weight takes a
 TABLE = "half"     # the table's entries: "half" (16 bits) or "float" (as the file holds them; then k = 3 gets 1 weight a gather)
 FUSE_STEPS = 1     # the steps between products as this module's kernels (0: mlx_lm's own operations)
 FUSE_ADD_NORM = 1  # a residual add and the norm after it in one launch
+TG_TABLE = 1       # 1: a trellis group reads one weight a gather from its 8 KB table, copied into threadgroup memory
 EXTRACT_BITS = 0   # 1: bit-field instructions in place of shift and mask (measured no faster)
 D = 8              # values per group in a product's `dims`
 
@@ -75,7 +76,7 @@ def width_code(k, g, scalar):
     return k | (g << 4) | (int(scalar) << 7)
 
 
-def _rows_fn(k, ch, kind, scalar=False, dense=False, g=1):
+def _rows_fn(k, ch, kind, scalar=False, dense=False, g=1, space="device"):
     """Metal source of the function that handles one threadgroup's rows of a group with k-bit symbols: their products
     with the input, or (dense) the weights themselves written, scaled, into a dense matrix of OUT_T.
 
@@ -91,8 +92,8 @@ def _rows_fn(k, ch, kind, scalar=False, dense=False, g=1):
     a = L.append
     name = f"lamq_{'sc' if scalar else 'tr'}{k}_g{g}_ch{ch}" + ("_dense" if dense else "")
     a(f"inline void {name}({'' if dense else 'const device float* x, '}const device uint* codes, uint wpr, uint rows, const device float* scales,")
-    a(f"                   const device int* map, const device {kind}* table, device {'OUT_T' if dense else 'float'}* y, uint n, uint tgl, uint ntg, uint simd, uint lane) {{")
-    a(f"    const device {vec}* tv = (const device {vec}*)table;")
+    a(f"                   const device int* map, const {space} {kind}* table, device {'OUT_T' if dense else 'float'}* y, uint n, uint tgl, uint ntg, uint simd, uint lane) {{")
+    a(f"    const {space} {vec}* tv = (const {space} {vec}*)table;")
     a(f"    const uint iters = n / {ch * 32};")
     a("    for (uint rb = tgl; rb * (SG * RPS) < rows; rb += ntg) {   // this threadgroup's row blocks: one table stays in its core's cache")
     a("    const uint r0 = (rb * SG + simd) * RPS;")
@@ -183,7 +184,8 @@ def _product_kernel(n, kind, widths, sg):
     key = (n, kind, widths, sg)
     if key not in _PRODUCTS:
         ch = chunk(n)
-        fns = {w: _rows_fn(w[0], ch, kind, scalar=w[1], g=w[2]) for w in widths}
+        space = "threadgroup" if TG_TABLE else "device"
+        fns = {w: _rows_fn(w[0], ch, kind, scalar=w[1], g=w[2], space=space) for w in widths}
         header = f"#define RPS {RPS}u\n#define SG {sg}u\n" + "\n".join(src for _, src in fns.values())
         body = [f"const uint tg = threadgroup_position_in_grid.x, gi = (uint)group_of[2 * tg], tgl = (uint)group_of[2 * tg + 1];",
                 f"const device uint* d = dims + gi * {D};",
@@ -193,10 +195,16 @@ def _product_kernel(n, kind, widths, sg):
                 "const device int* mp = map + d[4];",
                 f"const device {kind}* tb = tables + d[5];",
                 "const device float* xv = x + d[7];",
-                "const uint simd = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;",
-                "switch (d[6]) {"]
+                "const uint simd = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;"]
+        if TG_TABLE:
+            body += [f"threadgroup {kind} tt[{1 << L_STATE}];",
+                     f"const uint tlen = (d[6] & 128u) ? (1u << (d[6] & 15u)) : {1 << L_STATE}u;",
+                     "for (uint i = thread_position_in_threadgroup.x; i < tlen; i += threads_per_threadgroup.x) tt[i] = tb[i];",
+                     "threadgroup_barrier(mem_flags::mem_threadgroup);"]
+        table = "tt" if TG_TABLE else "tb"
+        body.append("switch (d[6]) {")
         for (k, scalar, g), (name, _) in fns.items():
-            body.append(f"    case {width_code(k, g, scalar)}u: {name}(xv, c, wpr, rows, sc, mp, tb, y, {n}u, tgl, ntg, simd, lane); break;")
+            body.append(f"    case {width_code(k, g, scalar)}u: {name}(xv, c, wpr, rows, sc, mp, {table}, y, {n}u, tgl, ntg, simd, lane); break;")
         body.append("}")
         _PRODUCTS[key] = mx.fast.metal_kernel(name=f"lamq_product_{n}_{kind}_{sg}_{'_'.join(f'{k}{int(s)}{g}' for k, s, g in widths)}",
                                               input_names=["x", "codes", "scales", "map", "tables", "dims", "group_of"],
@@ -245,7 +253,7 @@ class Product:
             c = np.ascontiguousarray(g["codes"], dtype=np.uint32)
             rows, wpr = c.shape
             assert wpr == n // 32 * k, (wpr, n, k)
-            wg = 1 if scalar else weights_per_gather(k, kind, gather)
+            wg = 1 if scalar or TG_TABLE else weights_per_gather(k, kind, gather)
             if scalar:
                 t = np.asarray(g["table"], dtype=dtype)
             else:
