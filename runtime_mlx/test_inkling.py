@@ -531,7 +531,7 @@ def test_nvfp4_unified_moe_all_modes() -> None:
                 y_v2 = kern_v2(
                     inputs=[
                         x_rot.reshape(-1), umoe.codes, umoe.scales, umoe.exp_fid, umoe.exp_code_off, umoe.exp_scale_off,
-                        *umoe._lut_args_sg8, units, ucnt, _u32(m_rows, x_div), order, x_raw.reshape(-1), *umoe._nv_args,
+                        *umoe._lut_args, units, ucnt, _u32(m_rows, x_div), order, x_raw.reshape(-1), *umoe._nv_args,
                     ],
                     grid=(max_u * sg_p * 32, rblocks, 1),
                     threadgroup=(sg_p * 32, 1, 1),
